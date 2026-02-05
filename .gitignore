@@ -1,0 +1,15 @@
+# Node.js
+node_modules/
+npm-debug.log
+yarn-error.log
+.env
+
+# Data and Secrets
+data/
+data/secrets/
+data/wallets/
+data/content/
+
+# Build artifacts
+dist/
+build/
