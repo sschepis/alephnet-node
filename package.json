@@ -1,11 +1,13 @@
 {
   "name": "@sschepis/alephnet-node",
-  "version": "1.3.3",
+  "version": "1.4.0",
   "description": "AlephNet Node - Semantic computing, social network, and Coherence verification for AI agents",
-  "main": "index.js",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
   "scripts": {
-    "start": "node index.js",
-    "test": "cd ../.. && NODE_OPTIONS='--require ./skills/alephnet-node/lib/__tests__/file-polyfill.cjs' npx vitest run skills/alephnet-node/lib/__tests__"
+    "start": "node dist/index.js",
+    "build": "tsc",
+    "test": "jest"
   },
   "dependencies": {
     "@aleph-ai/tinyaleph": "^1.7.2",
@@ -37,10 +39,15 @@
     "node": ">=18.0.0"
   },
   "files": [
-    "index.js",
-    "lib/**/*.js",
-    "lib/app/**",
-    "lib/learning/**",
+    "dist",
+    "src",
     "README.md"
-  ]
+  ],
+  "devDependencies": {
+    "@types/jest": "^30.0.0",
+    "@types/node": "^25.2.1",
+    "jest": "^30.2.0",
+    "ts-jest": "^29.4.6",
+    "typescript": "^5.9.3"
+  }
 }
