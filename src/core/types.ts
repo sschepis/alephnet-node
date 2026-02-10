@@ -334,8 +334,13 @@ export interface AgentTriggerEvent {
  * Bridge interface
  */
 export interface AlephGunBridge {
-  initialize(gun: any, dsnNode: any, agentManager: any): Promise<void>;
-  projectToSMF(graphPath: string, data: any): number[];
+  initialize(gun: any, dsnNode: any, agentManager: any, embeddingService?: any): Promise<void>;
+  authenticate(pair: any): Promise<void>;
+  getGun(): any;
+  subscribe(path: string, callback: (data: any) => void): () => void;
+  put(path: string, data: any): Promise<void>;
+  get(path: string): Promise<any>;
+  projectToSMF(graphPath: string, data: any): Promise<number[]>;
   routeRequest(event: AgentTriggerEvent): Promise<RoutingDecision>;
   verifyCoherence(proposal: any): Promise<boolean>;
   syncGMFToGraph(): Promise<void>;

@@ -22,9 +22,12 @@ export * from './constants';
 
 // Logging
 export * from './logging';
+export * from './gun-utils';
+
 
 // Observability (Metrics & Tracing)
 export * from './observability/index';
 
 // Types
 export * from './types';
+export * from './trust-types';

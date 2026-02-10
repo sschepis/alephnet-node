@@ -232,6 +232,12 @@ export interface Initializable {
   isInitialized(): boolean;
 }
 
+export interface HealthStatus {
+  status: 'healthy' | 'degraded' | 'unhealthy';
+  lastCheck: number;
+  details?: Record<string, any>;
+}
+
 /**
  * Health check pattern
  */
@@ -239,8 +245,41 @@ export interface HealthCheckable {
   healthCheck(): Promise<HealthStatus>;
 }
 
-export interface HealthStatus {
-  healthy: boolean;
-  timestamp: Timestamp;
-  details?: Record<string, unknown>;
+
+// ═══════════════════════════════════════════════════════════════════════════
+// DOMAIN SYSTEM
+// ═══════════════════════════════════════════════════════════════════════════
+
+export type DomainVisibility = 'public' | 'private' | 'secret';
+export type DomainRole = 'owner' | 'admin' | 'member' | 'guest';
+export type MembershipStatus = 'pending' | 'active' | 'suspended' | 'banned';
+
+export interface DomainRules {
+  minStakingTier: StakingTier;
+  minReputation: number;
+  requiresApproval: boolean;
+  whitelist?: string[];
+  blacklist?: string[];
+  grantedCapabilities: string[];
+}
+
+export interface DomainDefinition {
+  id: string;
+  handle: string;
+  name: string;
+  description: string;
+  ownerId: string;
+  createdAt: number;
+  visibility: DomainVisibility;
+  rules: DomainRules;
+  metadata: Record<string, unknown>;
+}
+
+export interface DomainMembership {
+  domainId: string;
+  userId: string;
+  role: DomainRole;
+  status: MembershipStatus;
+  joinedAt: number;
+  approvedBy?: string;
 }

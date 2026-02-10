@@ -15,8 +15,8 @@ export class HealthCheckService {
         results[name] = await check.healthCheck();
       } catch (error: any) {
         results[name] = {
-          healthy: false,
-          timestamp: Date.now(),
+          status: 'unhealthy',
+          lastCheck: Date.now(),
           details: { error: error.message }
         };
       }
@@ -27,6 +27,6 @@ export class HealthCheckService {
 
   async isHealthy(): Promise<boolean> {
     const results = await this.checkAll();
-    return Object.values(results).every(r => r.healthy);
+    return Object.values(results).every(r => r.status === 'healthy');
   }
 }

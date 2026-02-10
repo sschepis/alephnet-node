@@ -335,18 +335,34 @@ export class DSNNode {
 
   /**
    * Register node in the mesh on startup
+   * Note: Gun.js does not support arrays, so we only put scalar/object fields.
    */
   private async registerInMesh(): Promise<void> {
     if (!this.gun) return;
     
     const gun = this.gun as any;
     if (typeof gun.get !== 'function') return;
+
+    // Gun.js rejects arrays — only store scalar properties
+    const meshData: Record<string, any> = {
+      nodeId: this.config.nodeId,
+      name: this.config.name,
+      domain: this.config.domain,
+      seaPublicKey: this.config.seaPublicKey,
+      semanticDomain: this.config.semanticDomain,
+      sriaCapable: this.config.sriaCapable,
+      bootstrapUrl: this.config.bootstrapUrl,
+      status: this.config.status,
+      lastHeartbeat: this.config.lastHeartbeat,
+      loadIndex: this.config.loadIndex,
+      stakingTier: this.config.stakingTier,
+      alephBalance: this.config.alephBalance,
+      fingerprint: this.keyTriplet.fingerprint,
+      registeredAt: Date.now()
+    };
     
     return new Promise<void>((resolve) => {
-      gun.get('mesh').get('nodes').get(this.config.nodeId).put({
-        ...this.config,
-        registeredAt: Date.now()
-      }, (ack: any) => {
+      gun.get('mesh').get('nodes').get(this.config.nodeId).put(meshData, (ack: any) => {
         if (ack.err) {
           logger.error('Failed to register in mesh', new Error(ack.err));
         } else {

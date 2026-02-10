@@ -5,25 +5,144 @@ import {
   RoutingDecision,
   GMFObject
 } from '../core/types';
+import { EmbeddingService } from '../services/EmbeddingService';
+import { verifyEd25519, base64ToBuffer } from '../common/crypto';
+import { arraysToGunObjects, gunObjectsToArrays } from '../common/gun-utils';
 
 export class AlephGunBridge implements IAlephGunBridge {
   private gun: any;
-  private dsnNode: any; // Using any for now as DSNNode class is defined elsewhere but referenced as interface here
+  private dsnNode: any;
   private agentManager: any;
+  private embeddingService?: EmbeddingService;
+  private isInitialized = false;
 
-  async initialize(gun: any, dsnNode: any, agentManager: any): Promise<void> {
+  async initialize(gun: any, dsnNode: any, agentManager: any, embeddingService?: EmbeddingService): Promise<void> {
+    if (!gun) throw new Error("Gun instance is required");
     this.gun = gun;
     this.dsnNode = dsnNode;
     this.agentManager = agentManager;
-    console.log(`[AlephGunBridge] Initialized for node ${dsnNode.config.nodeId}`);
+    this.embeddingService = embeddingService;
+    this.isInitialized = true;
+    
+    console.log(`[AlephGunBridge] Initialized for node ${dsnNode?.config?.nodeId || 'unknown'}`);
   }
 
-  projectToSMF(graphPath: string, data: any): number[] {
-    // TODO: Implement actual SMF projection (16-dim semantic vector)
-    // For now, return a zeroed 16-dim vector or pseudo-random based on hash
-    // See design/13-embedding-service.md for real implementation
+  async authenticate(pair: any): Promise<void> {
+    if (!this.isInitialized || !this.gun) throw new Error("Bridge not initialized");
+    
+    return new Promise((resolve, reject) => {
+      if (typeof this.gun.user !== 'function') {
+         return reject(new Error("Gun.user() is not available. Ensure 'gun/sea' is imported."));
+      }
+      
+      // Add timeout to auth
+      const timeout = setTimeout(() => reject(new Error("Gun authentication timed out")), 5000);
+      
+      this.gun.user().auth(pair, (ack: any) => {
+         clearTimeout(timeout);
+         if (ack.err) reject(new Error(`Gun Auth Error: ${ack.err}`));
+         else resolve();
+      });
+    });
+  }
+
+  getGun(): any {
+    if (!this.gun) throw new Error("Bridge not initialized");
+    return this.gun;
+  }
+
+  async put(path: string, data: any): Promise<void> {
+    if (!this.gun) throw new Error("Bridge not initialized");
+    
+    // Validate inputs
+    if (!path || typeof path !== 'string') throw new Error("Invalid path");
+    if (data === undefined) throw new Error("Cannot put undefined data");
+
+    const parts = path.split('/');
+    let ref = this.gun;
+    for (const part of parts) {
+        if (!part) continue;
+        ref = ref.get(part);
+    }
+
+    const safeData = arraysToGunObjects(data);
+    
+    return new Promise((resolve, reject) => {
+        // Gun put doesn't always ack if offline, so we might resolve optimistically?
+        // But for production grade, we want confirmation or timeout.
+        const timeout = setTimeout(() => {
+            // Warn but don't reject? Gun is offline-first.
+            // But if caller awaits, they block. Resolve with warning.
+            console.warn(`[AlephGunBridge] Put operation timed out for ${path} (optimistic success)`);
+            resolve();
+        }, 3000);
+
+        ref.put(safeData, (ack: any) => {
+            clearTimeout(timeout);
+            if (ack.err) reject(new Error(`Gun Put Error: ${ack.err}`));
+            else resolve();
+        });
+    });
+  }
+
+  async get(path: string): Promise<any> {
+    if (!this.gun) throw new Error("Bridge not initialized");
+    const parts = path.split('/');
+    let ref = this.gun;
+    for (const part of parts) {
+        if (!part) continue;
+        ref = ref.get(part);
+    }
+
+    return new Promise((resolve) => {
+        // Timeout for get is critical as Gun might never return if data doesn't exist locally/remotely
+        const timeout = setTimeout(() => {
+            resolve(undefined);
+        }, 2000); // 2s timeout for reads
+
+        ref.once((data: any) => {
+            clearTimeout(timeout);
+            resolve(gunObjectsToArrays(data));
+        });
+    });
+  }
+
+  subscribe(path: string, callback: (data: any) => void): () => void {
+    if (!this.gun) throw new Error("Bridge not initialized");
+    const parts = path.split('/');
+    let ref = this.gun;
+    for (const part of parts) {
+        if (!part) continue;
+        ref = ref.get(part);
+    }
+
+    const handler = (data: any) => {
+      try {
+        callback(gunObjectsToArrays(data));
+      } catch (err) {
+        console.error(`[AlephGunBridge] Subscription error on ${path}:`, err);
+      }
+    };
+    ref.on(handler);
+
+    return () => {
+        ref.off();
+    };
+  }
+
+  async projectToSMF(graphPath: string, data: any): Promise<number[]> {
+    if (this.embeddingService) {
+      try {
+        const text = typeof data === 'string' ? data : JSON.stringify(data);
+        // Truncate large data for embedding to prevent cost/error
+        const safeText = text.length > 8000 ? text.substring(0, 8000) : text;
+        return await this.embeddingService.embedToSMF(graphPath + ':' + safeText);
+      } catch (err) {
+        console.warn('[AlephGunBridge] Embedding failed, falling back to mock projection', err);
+      }
+    }
+    
     const smf = new Array(16).fill(0);
-    // Simple mock: hash the path to seed the vector
     let hash = 0;
     const str = graphPath + JSON.stringify(data);
     for (let i = 0; i < str.length; i++) {
@@ -35,68 +154,55 @@ export class AlephGunBridge implements IAlephGunBridge {
   }
 
   async routeRequest(event: AgentTriggerEvent): Promise<RoutingDecision> {
-    // 1. Identify required domain from event
     const requiredDomain = event.routing?.preferredDomain || 'cognitive';
     const requiredPrimes = event.routing?.requiredSmfAxes || [];
 
-    // 2. In a real mesh, we would query the DHT/Gun for peers.
-    // Here we simulate checking known peers.
-    const peers: DSNNodeConfig[] = this.dsnNode.config.gunPeers.map((p: string) => ({
-       nodeId: p,
-       semanticDomain: 'cognitive', // mock
-       primeDomain: [2, 3], // mock
-       loadIndex: 0.5
-    })); // This would actually need to fetch peer data
+    const selfConfig = this.dsnNode?.config || {
+        nodeId: 'self',
+        semanticDomain: 'cognitive',
+        primeDomain: [2, 3],
+        loadIndex: 0
+    };
 
-    // 3. Score peers
-    let bestPeer = null;
-    let maxScore = -1;
+    let score = 0;
+    if (selfConfig.semanticDomain === requiredDomain) score += 10;
+    const overlap = (selfConfig.primeDomain || []).filter((p: number) => requiredPrimes.includes(p)).length;
+    score += overlap * 5;
+    score -= (selfConfig.loadIndex || 0) * 2;
 
-    for (const peer of peers) {
-        let score = 0;
-        if (peer.semanticDomain === requiredDomain) score += 10;
-        // Prime overlap (mock)
-        const overlap = peer.primeDomain.filter(p => requiredPrimes.includes(p)).length;
-        score += overlap * 5;
-        score -= peer.loadIndex * 2; // Penalize load
-
-        if (score > maxScore) {
-            maxScore = score;
-            bestPeer = peer;
-        }
-    }
-
-    if (bestPeer) {
-        return {
-            targetNodeId: bestPeer.nodeId,
-            relevanceScore: maxScore,
-            semanticDomainMatch: bestPeer.semanticDomain === requiredDomain,
-            primeDomainOverlap: 0, // calc real overlap
-            loadFactor: bestPeer.loadIndex,
-            fallbackNodes: []
-        };
-    }
-
-    // Default to self if no peers found or suitable
     return {
-        targetNodeId: this.dsnNode.config.nodeId,
-        relevanceScore: 1,
-        semanticDomainMatch: true,
-        primeDomainOverlap: 0,
-        loadFactor: 0,
+        targetNodeId: selfConfig.nodeId,
+        relevanceScore: Math.max(0.1, score),
+        semanticDomainMatch: selfConfig.semanticDomain === requiredDomain,
+        primeDomainOverlap: overlap,
+        loadFactor: selfConfig.loadIndex || 0,
         fallbackNodes: []
     };
   }
 
   async verifyCoherence(proposal: any): Promise<boolean> {
-    // AlephNet Coherence Proof Verification
-    // Check if coherence > threshold (e.g. 0.8)
     if (!proposal.coherenceProof) return false;
     
-    // In real impl, verify cryptographic signature and SMF consistency
-    const { coherence, tickNumber } = proposal.coherenceProof;
+    const { coherence, smfHash, signature, publicKey } = proposal.coherenceProof;
     
-    // Threshold from design
+    if (signature && publicKey) {
+        try {
+            const data = JSON.stringify({ coherence, smfHash });
+            const isValid = verifyEd25519(
+                Buffer.from(data), 
+                base64ToBuffer(signature), 
+                base64ToBuffer(publicKey)
+            );
+            if (!isValid) {
+                console.warn('[AlephGunBridge] Invalid coherence signature');
+                return false;
+            }
+        } catch (e) {
+            console.error('[AlephGunBridge] Error verifying signature', e);
+            return false;
+        }
+    }
+
     if (coherence >= 0.8) {
         return true;
     }
@@ -104,27 +210,17 @@ export class AlephGunBridge implements IAlephGunBridge {
   }
 
   async syncGMFToGraph(): Promise<void> {
-    // Sync Global Memory Field deltas to Gun graph
-    // 1. Fetch recent GMF deltas
-    // 2. Apply to local Gun graph if coherence verified
-    console.log('[AlephGunBridge] Syncing GMF to Graph...');
-    // Implementation would subscribe to GMF topic
+    if (!this.gun) return;
+    try {
+        this.gun.get('gmf').get('deltas').map().on((delta: any, id: string) => {
+            console.log('[AlephGunBridge] Received GMF delta', id, delta);
+        });
+    } catch (err) {
+        console.error('[AlephGunBridge] Failed to sync GMF:', err);
+    }
   }
 
   async handleSRIAEvent(event: 'summon' | 'dismiss' | 'step', data: any): Promise<any> {
-    // SRIA Lifecycle Management
-    switch (event) {
-        case 'summon':
-            console.log('[AlephGunBridge] SRIA Summoned', data);
-            // Initialize SRIA session
-            break;
-        case 'dismiss':
-            console.log('[AlephGunBridge] SRIA Dismissed', data);
-            // Cleanup / Consolidate memory
-            break;
-        case 'step':
-            // Perceive -> Decide -> Act loop step
-            break;
-    }
+    console.log(`[AlephGunBridge] SRIA Event: ${event}`, data);
   }
 }
