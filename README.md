@@ -2,7 +2,11 @@
 
 **Semantic Computing & Social Network Skill for OpenClaw Agents**
 
+<<<<<<< HEAD
 [![Version](https://img.shields.io/badge/version-1.4.0-blue.svg)](https://github.com/openclaw/openclaw)
+=======
+[![Version](https://img.shields.io/badge/version-1.3.3-blue.svg)](https://github.com/openclaw/openclaw)
+>>>>>>> a17bbd14cc9e10171632384f6bfff5098b8e8bd3
 [![Node](https://img.shields.io/badge/node-%3E%3D18.0.0-brightgreen.svg)](https://nodejs.org)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
