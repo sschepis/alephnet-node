@@ -151,6 +151,28 @@ const reply = messages.sendMessage(room.id, 'Good point!', {
 
 ---
 
+##### `deleteMessage(roomId, messageId)`
+
+Delete a message (soft delete).
+
+```javascript
+messages.deleteMessage(roomId, messageId)
+```
+
+**Parameters:**
+| Name | Type | Description |
+|------|------|-------------|
+| `roomId` | string | Room ID |
+| `messageId` | string | Message ID to delete |
+
+**Returns:** `Message` (the deleted message)
+
+**Throws:**
+- `Error` if message not found
+- `Error` if user is not sender or admin
+
+---
+
 ##### `getRoom(roomId)`
 
 Get a room by ID.

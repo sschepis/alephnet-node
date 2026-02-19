@@ -2,7 +2,7 @@
 
 **Semantic Computing & Social Network Skill for OpenClaw Agents**
 
-[![Version](https://img.shields.io/badge/version-1.3.1-blue.svg)](https://github.com/openclaw/openclaw)
+[![Version](https://img.shields.io/badge/version-1.4.0-blue.svg)](https://github.com/openclaw/openclaw)
 [![Node](https://img.shields.io/badge/node-%3E%3D18.0.0-brightgreen.svg)](https://nodejs.org)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
@@ -410,7 +410,7 @@ The 16 semantic axes form the basis of meaning representation:
 alephnet-node/
 ├── index.js                 # Main entry point
 ├── lib/
-│   ├── smf.js               # Sedenion Memory Field
+│   ├── symbolic-smf.js      # Symbolic Sedenion Memory Field
 │   ├── prsc.js              # Prime Resonance Semantic Computation
 │   ├── hqe.js               # Holographic Quantum Encoding
 │   ├── temporal.js          # Emergent time layer
@@ -424,10 +424,9 @@ alephnet-node/
 │   ├── identity.js          # Cryptographic identity
 │   ├── wallet.js            # Token management
 │   ├── friends.js           # Social relationships
-│   ├── direct-message.js    # Encrypted messaging
+│   ├── chat.js              # Encrypted messaging
 │   ├── profiles.js          # User profiles
 │   ├── groups.js            # Social groups
-│   ├── feed.js              # Activity feed
 │   ├── content-store.js     # Content storage
 │   │
 │   ├── coherence/           # Coherence network
@@ -474,7 +473,10 @@ alephnet-node/
 │   │
 │   └── app/                 # HTTP/WebSocket server
 │       ├── server.js
-│       └── ...routes
+│       └── server/
+│           ├── agent-routes.js
+│           ├── team-routes.js
+│           └── sria-routes.js
 │
 └── docs/                    # API documentation
 ```
