@@ -79,40 +79,87 @@ describe('TaskManager', () => {
 
     it('should execute successfully with valid input', async () => {
       const exec = await manager.executeTask('task-1', { val: 'test' }, { triggeredBy: 'test' });
-      
-      // Since runExecution is async and not awaited by executeTask, we need to wait for promise resolution
-      // But runExecution isn't returned. We can check the executions map or wait for next tick.
-      // Or we can assume logic runs synchronously enough for mock testing or wait a tiny bit.
-      // But it sets status to PENDING then calls async runExecution.
-      // In the implementation provided, runExecution awaits nothing real (mock logic), but is async.
-      
-      await Promise.resolve(); // Flush microtasks
-      await Promise.resolve(); 
 
       expect(exec.status).toBe('COMPLETED');
       expect(exec.output?.data).toContain('Simulated output');
       expect(exec.attempts.current).toBe(1);
     });
 
-    it('should fail if input validation fails', async () => {
-       // Missing required 'val'
-       const exec = await manager.executeTask('task-1', {}, { triggeredBy: 'test' });
-       
-       await Promise.resolve();
-       await Promise.resolve();
+    it('should reject with the final error only after retries are exhausted', async () => {
+      // Missing required 'val' fails validation on every attempt.
+      const execPromise = manager.executeTask('task-1', {}, { triggeredBy: 'test' });
 
-       expect(exec.status).toBe('FAILED');
-       expect(exec.error?.message).toContain('Missing required input: val');
+      // First retry (1000ms backoff) has not fired yet: nothing has settled.
+      let settled = false;
+      execPromise.then(() => { settled = true; }, () => { settled = true; });
+      await jest.advanceTimersByTimeAsync(999);
+      await Promise.resolve();
+      expect(settled).toBe(false);
+
+      // Exhaust the full attempt chain (1000ms + 2000ms backoff).
+      await jest.advanceTimersByTimeAsync(5000);
+
+      const error: any = await execPromise.catch((e: any) => e);
+      expect(error).toBeInstanceOf(Error);
+      expect(error.message).toContain('Missing required input: val');
+
+      // The failed execution is attached for callers that catch.
+      expect(error.execution).toBeDefined();
+      expect(error.execution.status).toBe('FAILED');
+      expect(error.execution.attempts.current).toBe(3);
+      expect(error.execution.attempts.history).toHaveLength(3);
     });
 
-    it('should correctly replace template variables', async () => {
-        // We can't easily inspect the internal prompt variable in this unit test without spying on private method
-        // or checking if the 'Simulated output' reflected it (it doesn't in the mock).
-        // But we can trust the logic if the happy path runs.
-        // Actually, let's spy on console.log or similar if we wanted, or just assume success.
-        const exec = await manager.executeTask('task-1', { val: 'foo' }, { triggeredBy: 'test' });
-        await Promise.resolve(); await Promise.resolve();
-        expect(exec.status).toBe('COMPLETED');
+    it('should resolve with the final settled execution after transient retries', async () => {
+      let calls = 0;
+      const executor = async () => {
+        calls++;
+        if (calls < 3) throw new Error('transient failure');
+        return { output: 'recovered', coherence: 1 };
+      };
+
+      const execPromise = manager.executeTask(
+        'task-1',
+        { val: 'x' },
+        { triggeredBy: 'test', executor }
+      );
+
+      await jest.advanceTimersByTimeAsync(5000);
+
+      const exec = await execPromise;
+      expect(exec.status).toBe('COMPLETED');
+      expect(exec.output?.data).toBe('recovered');
+      expect(exec.attempts.current).toBe(3);
+      expect(calls).toBe(3);
+    });
+
+    it('should not settle while retries are still pending', async () => {
+      let calls = 0;
+      const executor = async () => {
+        calls++;
+        throw new Error('boom');
+      };
+
+      const execPromise = manager.executeTask(
+        'task-1',
+        { val: 'x' },
+        { triggeredBy: 'test', executor }
+      );
+
+      // Let the first retry fire (1000ms): attempt 2 has run and failed, but a
+      // further retry (2000ms) is still scheduled, so the promise must stay
+      // pending.
+      let settled = false;
+      execPromise.then(() => { settled = true; }, () => { settled = true; });
+      await jest.advanceTimersByTimeAsync(1000);
+      await Promise.resolve();
+      expect(calls).toBe(2);
+      expect(settled).toBe(false);
+
+      // Exhaust the chain: the final attempt fails and executeTask rejects.
+      await jest.advanceTimersByTimeAsync(5000);
+      await expect(execPromise).rejects.toThrow('boom');
+      expect(calls).toBe(3);
     });
   });
 
@@ -121,31 +168,72 @@ describe('TaskManager', () => {
       manager.registerTask(mockTask);
     });
 
-    it('should retry on failure', async () => {
-      // Mock validation to fail always? Or use a task that fails?
-      // The current implementation only fails on validation or internal error.
-      // Let's force a failure by passing invalid input, BUT invalid input is non-recoverable usually?
-      // The code says "recoverable: true" for catch-all.
-      
-      const exec = await manager.executeTask('task-1', {}, { triggeredBy: 'test' });
-      
-      await Promise.resolve(); await Promise.resolve();
-      // First attempt failed. Status FAILED.
-      // It schedules retry.
-      expect(exec.attempts.current).toBe(1);
-      expect(exec.status).toBe('FAILED');
+    it('should run the full attempt chain before settling', async () => {
+      const execPromise = manager.executeTask('task-1', {}, { triggeredBy: 'test' });
 
-      // Fast forward time for retry
-      jest.advanceTimersByTime(1001); // backoff 1000
-      await Promise.resolve(); await Promise.resolve();
-      
-      expect(exec.attempts.current).toBe(2);
+      // Initial attempt has failed (validation); a retry is scheduled but the
+      // returned promise must not resolve yet.
+      let settled = false;
+      execPromise.then(() => { settled = true; }, () => { settled = true; });
+      await jest.advanceTimersByTimeAsync(1);
+      await Promise.resolve();
+      expect(settled).toBe(false);
+
+      // First retry fires (1000ms backoff): attempt 2 fails, still pending.
+      await jest.advanceTimersByTimeAsync(1000);
+      await Promise.resolve();
+      expect(settled).toBe(false);
+
+      // Second retry fires (2000ms backoff): attempt 3 fails, the chain is
+      // exhausted and the promise rejects with the final error.
+      await jest.advanceTimersByTimeAsync(2000);
+      const error: any = await execPromise.catch((e: any) => e);
+      expect(error).toBeInstanceOf(Error);
+      expect(error.execution.attempts.current).toBe(3);
+      expect(error.execution.status).toBe('FAILED');
+    });
+
+    it('should reject (not console.error-swallow) when the final attempt fails', async () => {
+      const consoleSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+      let calls = 0;
+      const executor = async () => {
+        calls++;
+        throw new Error('terminal failure');
+      };
+
+      const execPromise = manager.executeTask(
+        'task-1',
+        { val: 'x' },
+        { triggeredBy: 'test', executor }
+      );
+      // Attach the handler BEFORE the rejection fires so it is never
+      // unhandled.
+      const handled = execPromise.catch((e: any) => e);
+
+      await jest.advanceTimersByTimeAsync(5000);
+
+      const error: any = await handled;
+      expect(error).toBeInstanceOf(Error);
+      expect(error.message).toContain('terminal failure');
+      expect(calls).toBe(3);
+      // The terminal failure surfaces through the tracked promise; it is not
+      // swallowed by an internal console.error retry handler.
+      expect(consoleSpy).not.toHaveBeenCalled();
+      consoleSpy.mockRestore();
     });
   });
 
   describe('Cron Scheduling', () => {
+    // Scheduled runs are fired with empty input, so cron tasks use a schema
+    // with no required fields (otherwise they would fail validation and spew
+    // retry noise into the console during these tests).
+    const cronTaskBase = {
+      ...mockTask,
+      inputs: { schema: { type: 'object', properties: {}, required: [] } }
+    } as TaskDefinition;
+
     it('should trigger task when cron matches', () => {
-      const cronTask = { ...mockTask, id: 'cron-1', schedule: { ...mockTask.schedule, type: 'CRON', cron: '* * * * *' } } as TaskDefinition;
+      const cronTask = { ...cronTaskBase, id: 'cron-1', schedule: { ...mockTask.schedule, type: 'CRON', cron: '* * * * *' } } as TaskDefinition;
       manager.registerTask(cronTask);
       
       const spy = jest.spyOn(manager, 'executeTask');
@@ -158,7 +246,7 @@ describe('TaskManager', () => {
 
     it('should not trigger if cron does not match', () => {
         // Cron: 59th minute only
-        const cronTask = { ...mockTask, id: 'cron-2', schedule: { ...mockTask.schedule, type: 'CRON', cron: '59 * * * *' } } as TaskDefinition;
+        const cronTask = { ...cronTaskBase, id: 'cron-2', schedule: { ...mockTask.schedule, type: 'CRON', cron: '59 * * * *' } } as TaskDefinition;
         manager.registerTask(cronTask);
         const spy = jest.spyOn(manager, 'executeTask');
 

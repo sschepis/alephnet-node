@@ -86,6 +86,9 @@ function getPolicyBaseParameters(type: PolicyType): Record<string, unknown> {
 
 /**
  * Estimate expected free energy for a policy type
+ * 
+ * Lower is better (EFE is a cost): negative baselines mark policy types that
+ * are expected to reduce free energy.
  */
 function estimateExpectedFreeEnergy(
   type: PolicyType,
@@ -182,6 +185,9 @@ function estimateRisk(type: PolicyType, beliefs: BeliefState[]): number {
 
 /**
  * Evaluate policies and compute expected free energy
+ * 
+ * The returned `expectedFreeEnergy` is a cost: goal distance and risk raise it,
+ * expected information gain lowers it. Selection minimizes it.
  */
 export function evaluatePolicies(
   policies: Policy[],
@@ -232,6 +238,23 @@ function predictPolicyOutcome(
 }
 
 /**
+ * How strongly each policy type expresses the current beliefs in the
+ * observation it is expected to produce.
+ * 
+ * Without this, every policy would predict the exact same observation and the
+ * pragmatic (goal distance) term could not discriminate between policies.
+ */
+const POLICY_COMMITMENT: Record<PolicyType, number> = {
+  PERCEIVE: 0.4,
+  THINK: 0.6,
+  RESPOND: 1.0,
+  TOOL_CALL: 0.9,
+  QUERY: 0.5,
+  CONSOLIDATE: 0.3,
+  SLEEP: 0.1
+};
+
+/**
  * Generate a single prediction
  */
 function generatePrediction(
@@ -244,8 +267,10 @@ function generatePrediction(
     .sort((a, b) => b.probability - a.probability)
     .slice(0, 3);
   
-  // Combine prime factors as prediction content
-  const content = topBeliefs.flatMap(b => b.primeFactors);
+  // Combine prime factors as prediction content, scaled by how much of the
+  // belief signature this policy is expected to express
+  const commitment = POLICY_COMMITMENT[policy.type] ?? 0.5;
+  const content = topBeliefs.flatMap(b => b.primeFactors.map(p => p * commitment));
   
   // Vary probability based on sample index
   const baseProbability = topBeliefs.length > 0 
@@ -269,6 +294,10 @@ function generatePrediction(
 
 /**
  * Select the best policy based on expected free energy
+ * 
+ * Expected free energy is a cost, so the lowest value wins: with the pragmatic
+ * term expressed as a goal-distance cost, policies closer to the goal are
+ * preferred.
  */
 export function selectPolicy(
   policies: Policy[],

@@ -46,8 +46,8 @@ export const CONSENSUS = {
   /** Minimum coherence score for proposal acceptance */
   MIN_COHERENCE_THRESHOLD: 0.7,
   
-  /** Required support ratio for consensus (2/3 majority) */
-  CONSENSUS_THRESHOLD: 0.66,
+  /** Required support ratio for consensus (exact 2/3 supermajority) */
+  CONSENSUS_THRESHOLD: 2 / 3,
   
   /** Minimum stake for voting */
   MIN_VOTE_STAKE: 10,

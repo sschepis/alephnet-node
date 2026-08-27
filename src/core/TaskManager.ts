@@ -105,11 +105,62 @@ export interface TaskExecution {
     format: string;
     smfSignature: number[];
     coherence: number;
+    /** True when no executor was wired in and the output is a simulation */
+    simulated?: boolean;
   };
   error?: {
     code: string;
     message: string;
     recoverable: boolean;
+  };
+}
+
+/**
+ * Result returned by a task executor
+ */
+export interface TaskExecutionResult {
+  output: any;
+  coherence?: number;
+  smf?: number[];
+}
+
+/**
+ * Injectable execution hook - wires a real engine (e.g. SRIA) into task runs.
+ */
+export type TaskExecutor = (context: {
+  task: TaskDefinition;
+  execution: TaskExecution;
+  prompt: string;
+  input: Record<string, any>;
+}) => Promise<TaskExecutionResult> | TaskExecutionResult;
+
+/**
+ * Injectable persistence hook for finished (or failed) executions.
+ */
+export type TaskResultSink = (execution: TaskExecution) => void | Promise<void>;
+
+export interface TaskManagerOptions {
+  /** Default executor for every task; can be overridden per execution */
+  executor?: TaskExecutor;
+  /** Where execution results are written. Defaults to a no-op. */
+  resultSink?: TaskResultSink;
+}
+
+/**
+ * Result sink that persists executions into Gun under tasks/<taskId>/executions/<executionId>
+ */
+export function createGunResultSink(gun: any): TaskResultSink {
+  return (execution: TaskExecution) => {
+    gun.get('tasks').get(execution.taskId).get('executions').get(execution.executionId).put({
+      executionId: execution.executionId,
+      taskId: execution.taskId,
+      status: execution.status,
+      startedAt: execution.timeline.startedAt ?? null,
+      completedAt: execution.timeline.completedAt ?? null,
+      attempts: execution.attempts.current,
+      output: execution.output ? JSON.stringify(execution.output) : null,
+      error: execution.error ? JSON.stringify(execution.error) : null
+    });
   };
 }
 
@@ -119,10 +170,15 @@ export class TaskManager {
   private tasks: Map<string, TaskDefinition> = new Map();
   private executions: Map<string, TaskExecution> = new Map();
   private scheduleInterval: NodeJS.Timeout | null = null;
+  private retryTimers: Set<NodeJS.Timeout> = new Set();
+  private pendingRetries = new Map<string, { execution: TaskExecution; reject: (error: Error) => void }>();
+  private nextRuns: Map<string, number> = new Map();
+  private stopped = false;
 
   constructor(
       private gun: any, 
-      private localNodeId: string
+      private localNodeId: string,
+      private options: TaskManagerOptions = {}
   ) {
       // Start scheduling loop
       this.scheduleInterval = setInterval(() => this.pollSchedules(), 60000); // Check every minute
@@ -130,14 +186,35 @@ export class TaskManager {
 
   public registerTask(task: TaskDefinition): void {
       this.tasks.set(task.id, task);
+      
+      // Seed the next run time for interval schedules
+      if (task.schedule.type === 'INTERVAL' && task.schedule.intervalMs) {
+          this.nextRuns.set(task.id, Date.now() + task.schedule.intervalMs);
+      } else {
+          this.nextRuns.delete(task.id);
+      }
+      
       // Persist to Gun
       this.gun.get('tasks').get(task.id).put({ definition: task });
   }
 
+  /**
+   * Run a task.
+   *
+   * The returned promise settles ONLY with the FINAL settled execution, after
+   * the full attempt chain has run (retries exhausted or an attempt
+   * succeeded). It never resolves while retries are still pending.
+   *
+   * - If the final attempt succeeds, resolves with the execution
+   *   (`status === 'COMPLETED'`).
+   * - If the final attempt fails, REJECTS with the last error; the failed
+   *   `TaskExecution` (with `status`, `error` and attempt history populated)
+   *   is attached to the error as `error.execution` for callers that catch.
+   */
   public async executeTask(
       taskId: string, 
       input: Record<string, any>, 
-      context: { triggeredBy: string; conversationId?: string }
+      context: { triggeredBy: string; conversationId?: string; executor?: TaskExecutor }
   ): Promise<TaskExecution> {
       const task = this.tasks.get(taskId);
       if (!task) throw new Error(`Task ${taskId} not found`);
@@ -156,15 +233,72 @@ export class TaskManager {
       };
       
       this.executions.set(executionId, execution);
-      this.runExecution(execution, task); // Fire and forget (async)
+
+      // Await the WHOLE attempt chain: retries run inside this call, not in
+      // detached background timers.
+      await this.runWithRetries(execution, task, context.executor);
+      
+      if (execution.status === 'FAILED') {
+          const error = new Error(execution.error?.message || `Task ${taskId} execution failed`);
+          (error as any).execution = execution;
+          throw error;
+      }
       
       return execution;
   }
 
-  private async runExecution(execution: TaskExecution, task: TaskDefinition) {
+  /**
+   * Drive one execution through its full attempt chain (initial attempt plus
+   * any retries) without ever leaving this promise unresolved while retries
+   * are still pending. Returns when the execution settles: an attempt
+   * succeeded, retries are exhausted, or the manager was stopped.
+   */
+  private async runWithRetries(
+      execution: TaskExecution,
+      task: TaskDefinition,
+      executor?: TaskExecutor
+  ): Promise<void> {
+      while (true) {
+          await this.runExecution(execution, task, executor);
+
+          if (execution.status !== 'FAILED') return;
+
+          const canRetry = !this.stopped && execution.attempts.current < execution.attempts.max;
+          if (!canRetry) return;
+
+          const delay = task.schedule.retry.backoffMs * Math.pow(task.schedule.retry.backoffMultiplier, execution.attempts.current - 1);
+          await this.sleepForRetry(execution, delay);
+      }
+  }
+
+  /**
+   * Cancellable retry backoff. Timers are tracked so stop() can cancel them;
+   * cancellation rejects the tracked promise, which surfaces through
+   * executeTask instead of being swallowed.
+   */
+  private sleepForRetry(execution: TaskExecution, delay: number): Promise<void> {
+      return new Promise<void>((resolve, reject) => {
+          const timer = setTimeout(() => {
+              this.retryTimers.delete(timer);
+              this.pendingRetries.delete(execution.executionId);
+              resolve();
+          }, delay);
+          this.retryTimers.add(timer);
+          this.pendingRetries.set(execution.executionId, { execution, reject });
+      });
+  }
+
+  private async runExecution(
+      execution: TaskExecution, 
+      task: TaskDefinition,
+      executor?: TaskExecutor
+  ): Promise<TaskExecution> {
       execution.status = 'RUNNING';
       execution.timeline.startedAt = Date.now();
       execution.attempts.current++;
+      
+      const attemptNumber = execution.attempts.current;
+      const attemptStartedAt = Date.now();
 
       try {
           // 1. Validation
@@ -173,41 +307,76 @@ export class TaskManager {
           // 2. Build Prompt
           const prompt = this.buildPrompt(task, execution.input);
           
-          // 3. Mock Execution (Integration with SRIA would happen here)
-          // const result = await this.sriaEngine.process(prompt, ...);
-          const result = { 
-              output: `Simulated output for ${task.name}`, 
-              coherence: 0.95,
-              smf: new Array(16).fill(0) 
-          }; // Mock result
+          // 3. Execution: use the injected executor when one is wired in,
+          //    otherwise fall back to a clearly-marked simulation.
+          const run = executor || this.options.executor;
+          const simulated = !run;
+          const result: TaskExecutionResult = run
+              ? await run({ task, execution, prompt, input: execution.input })
+              : {
+                  output: `Simulated output for ${task.name}`,
+                  coherence: 0.95,
+                  smf: new Array(16).fill(0)
+                };
 
           // 4. Output processing
           execution.output = {
               data: result.output,
               format: task.output.format,
-              smfSignature: result.smf,
-              coherence: result.coherence
+              smfSignature: result.smf || new Array(16).fill(0),
+              coherence: result.coherence !== undefined ? result.coherence : 0,
+              simulated
           };
           execution.status = 'COMPLETED';
           execution.timeline.completedAt = Date.now();
+          execution.error = undefined;
+          execution.attempts.history.push({
+              attemptNumber,
+              startedAt: attemptStartedAt,
+              endedAt: execution.timeline.completedAt,
+              status: 'COMPLETED'
+          });
 
       } catch (error: any) {
+          const message = error?.message || String(error);
+          const canRetry = !this.stopped && execution.attempts.current < execution.attempts.max;
+          
           execution.status = 'FAILED';
+          execution.timeline.completedAt = Date.now();
           execution.error = {
               code: 'EXEC_ERR',
-              message: error.message,
-              recoverable: true
+              message,
+              recoverable: canRetry
           };
+          execution.attempts.history.push({
+              attemptNumber,
+              startedAt: attemptStartedAt,
+              endedAt: execution.timeline.completedAt,
+              status: 'FAILED',
+              error: message
+          });
 
-          // Retry logic
-          if (execution.attempts.current < execution.attempts.max) {
-             const delay = task.schedule.retry.backoffMs * Math.pow(task.schedule.retry.backoffMultiplier, execution.attempts.current - 1);
-             setTimeout(() => this.runExecution(execution, task), delay);
-          }
+          // Retries are driven by runWithRetries, NOT background timers here.
       }
 
-      // Update Gun
-      // this.gun.get('tasks').get(taskId).get('executions').get(execution.executionId).put(execution);
+      // Persist the result through the injectable sink (default: no-op)
+      await this.persistExecution(execution);
+
+      return execution;
+  }
+
+  public getExecution(executionId: string): TaskExecution | undefined {
+      return this.executions.get(executionId);
+  }
+
+  private async persistExecution(execution: TaskExecution): Promise<void> {
+      const sink = this.options.resultSink;
+      if (!sink) return;
+      try {
+          await sink(execution);
+      } catch (error: any) {
+          console.error(`Failed to persist execution ${execution.executionId}: ${error?.message || error}`);
+      }
   }
 
   private validateInput(input: any, schema: any) {
@@ -231,6 +400,8 @@ export class TaskManager {
 
   private pollSchedules() {
       const now = new Date();
+      const nowMs = now.getTime();
+      
       for (const task of this.tasks.values()) {
           if (!task.schedule.enabled) continue;
           
@@ -239,17 +410,58 @@ export class TaskManager {
                   this.triggerScheduledTask(task);
               }
           } else if (task.schedule.type === 'INTERVAL' && task.schedule.intervalMs) {
-              // Interval check (simplified, really needs last run time from DB)
-              // Assuming memory-only for this demo:
-              // Use setInterval for intervals usually, but here we poll.
+              const intervalMs = task.schedule.intervalMs;
+              const nextRun = this.nextRuns.get(task.id);
+              
+              if (nextRun === undefined) {
+                  // First sighting: schedule one interval out
+                  this.nextRuns.set(task.id, nowMs + intervalMs);
+                  continue;
+              }
+              
+              if (nowMs >= nextRun) {
+                  // Advance past any windows missed while stalled instead of
+                  // firing once per missed window.
+                  const missed = Math.floor((nowMs - nextRun) / intervalMs) + 1;
+                  this.nextRuns.set(task.id, nextRun + missed * intervalMs);
+                  this.triggerScheduledTask(task);
+              }
           }
       }
   }
 
+  /**
+   * Next scheduled run for an INTERVAL task (epoch ms), if known
+   */
+  public getNextRun(taskId: string): number | undefined {
+      return this.nextRuns.get(taskId);
+  }
+
   private triggerScheduledTask(task: TaskDefinition) {
-      // Check concurrency limits, etc.
+      // Check concurrency limits
+      const inFlight = this.countInFlight(task.id);
+      if (task.schedule.maxConcurrent > 0 && inFlight >= task.schedule.maxConcurrent) {
+          console.warn(`Skipping ${task.name}: ${inFlight} execution(s) already in flight`);
+          return;
+      }
+      
       console.log(`Triggering scheduled task: ${task.name}`);
-      this.executeTask(task.id, {}, { triggeredBy: 'system-scheduler' });
+      this.executeTask(task.id, {}, { triggeredBy: 'system-scheduler' })
+          .catch((error: any) => {
+              console.error(`Scheduled task ${task.id} failed: ${error?.message || error}`);
+          });
+  }
+
+  private countInFlight(taskId: string): number {
+      let count = 0;
+      for (const execution of this.executions.values()) {
+          if (execution.taskId !== taskId) continue;
+          if (execution.status === 'PENDING' || execution.status === 'VALIDATING' ||
+              execution.status === 'RUNNING' || execution.status === 'AWAITING_SERVICE') {
+              count++;
+          }
+      }
+      return count;
   }
 
   /**
@@ -257,17 +469,24 @@ export class TaskManager {
    * Supports: asterisk (all), value (exact), asterisk/step (step), list (1,2)
    */
   private isCronDue(cron: string, date: Date): boolean {
-      const parts = cron.split(' ');
+      const parts = cron.trim().split(/\s+/);
       if (parts.length !== 5) return false;
 
       const [min, hour, dom, mon, dow] = parts;
       
-      const match = (val: number, pattern: string) => {
+      // `oneBased` fields (day-of-month, month) start counting at 1, so */step
+      // must be measured from the field minimum, not from zero.
+      const match = (val: number, pattern: string, oneBased: boolean = false) => {
           if (pattern === '*') return true;
           if (pattern.includes('/')) {
-              const [base, step] = pattern.split('/');
+              const [base, stepRaw] = pattern.split('/');
+              const step = parseInt(stepRaw);
+              if (!Number.isFinite(step) || step <= 0) return false;
               // Handle */step
-              if (base === '*') return val % parseInt(step) === 0;
+              if (base === '*') {
+                  const offset = oneBased ? val - 1 : val;
+                  return offset >= 0 && offset % step === 0;
+              }
               // Handle range/step? Simplified to just *
               return false;
           }
@@ -279,12 +498,39 @@ export class TaskManager {
 
       return match(date.getMinutes(), min) &&
              match(date.getHours(), hour) &&
-             match(date.getDate(), dom) &&
-             match(date.getMonth() + 1, mon) && // Month is 0-indexed in JS
+             match(date.getDate(), dom, true) && // Day of month is 1-based
+             match(date.getMonth() + 1, mon, true) && // Month is 0-indexed in JS, 1-based in cron
              match(date.getDay(), dow);
   }
   
   public stop() {
-      if (this.scheduleInterval) clearInterval(this.scheduleInterval);
+      this.stopped = true;
+      
+      if (this.scheduleInterval) {
+          clearInterval(this.scheduleInterval);
+          this.scheduleInterval = null;
+      }
+      
+      // Cancel any pending retries so the process can exit cleanly. Cancelled
+      // backoffs surface as rejections through executeTask (never swallowed),
+      // and the execution is marked CANCELLED.
+      for (const timer of this.retryTimers) {
+          clearTimeout(timer);
+      }
+      this.retryTimers.clear();
+
+      for (const [executionId, pending] of this.pendingRetries) {
+          const execution = pending.execution;
+          const error = new Error('Task manager stopped before retries completed');
+          (error as any).execution = execution;
+          execution.status = 'CANCELLED';
+          execution.error = {
+              code: 'CANCELLED',
+              message: error.message,
+              recoverable: false
+          };
+          pending.reject(error);
+      }
+      this.pendingRetries.clear();
   }
 }

@@ -13,3 +13,6 @@ data/content/
 # Build artifacts
 dist/
 build/
+
+# Local tooling state
+.obotovs/

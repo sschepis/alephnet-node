@@ -115,13 +115,71 @@ export interface ServiceInstance {
   };
 }
 
+// --- Errors & Access Context ---
+
+/**
+ * Machine-readable reasons a service call can be rejected.
+ */
+export type ServiceCallErrorCode =
+  | 'SERVICE_NOT_FOUND'
+  | 'SERVICE_SUSPENDED'
+  | 'ENDPOINT_NOT_FOUND'
+  | 'NO_HEALTHY_INSTANCE'
+  | 'ACCESS_UNDECLARED'
+  | 'VISIBILITY_DENIED'
+  | 'NODE_NOT_ALLOWED'
+  | 'USER_NOT_ALLOWED'
+  | 'TIER_NOT_ALLOWED'
+  | 'REPUTATION_TOO_LOW'
+  | 'REPUTATION_UNVERIFIABLE'
+  | 'COHERENCE_TOO_LOW'
+  | 'COHERENCE_UNVERIFIABLE'
+  | 'PRICING_UNDECLARED'
+  | 'RATE_LIMIT_EXCEEDED'
+  | 'COST_EXCEEDED'
+  | 'RPC_FAILED';
+
+/**
+ * Typed error for every service-call policy violation.
+ */
+export class ServiceCallError extends Error {
+  constructor(
+    public readonly code: ServiceCallErrorCode,
+    message: string,
+    public readonly details?: Record<string, unknown>
+  ) {
+    super(message);
+    this.name = 'ServiceCallError';
+  }
+}
+
+/**
+ * Supplies the caller-side signals that access rules are checked against.
+ * Both lookups return null when the value cannot be established, in which
+ * case a service that requires a minimum fails closed.
+ */
+export interface IServiceAccessContextProvider {
+  getReputation(userId: string): Promise<number | null>;
+  getCoherence(userId: string): Promise<number | null>;
+}
+
+/** Window used for the `burstLimit` check. */
+const BURST_WINDOW_MS = 1_000;
+const MINUTE_MS = 60_000;
+const HOUR_MS = 60 * MINUTE_MS;
+const DAY_MS = 24 * HOUR_MS;
+
 // --- Manager ---
 
 export class ServiceManager {
+  /** Local best-effort call log per `serviceId:callerId`, for rate limiting. */
+  private rateLimitLog = new Map<string, number[]>();
+
   constructor(
       private gun: any,
       private wallet: AlephWallet,
-      private localNodeId: string
+      private localNodeId: string,
+      private accessContext?: IServiceAccessContextProvider
   ) {}
 
   /**
@@ -210,6 +268,10 @@ export class ServiceManager {
 
   /**
    * Call a service.
+   *
+   * The service definition's own access policy is enforced here — visibility,
+   * allow-lists, staking tier, coherence/reputation minimums and rate limits —
+   * before any RPC is dispatched or any payment is authorized.
    */
   public async callService<T>(
       serviceId: string,
@@ -219,38 +281,299 @@ export class ServiceManager {
   ): Promise<{ result: T; cost: number; executorNode: string }> {
       // 1. Get Service Def
       const service = await this.getServiceDefinition(serviceId);
-      if (!service) throw new Error(`Service ${serviceId} not found`);
+      if (!service) throw new ServiceCallError('SERVICE_NOT_FOUND', `Service ${serviceId} not found`);
 
       // 2. Find Endpoint
-      const endpoint = service.interface.endpoints.find(e => e.name === endpointName);
-      if (!endpoint) throw new Error(`Endpoint ${endpointName} not found`);
+      const endpoint = service.interface?.endpoints?.find(e => e.name === endpointName);
+      if (!endpoint) {
+          throw new ServiceCallError('ENDPOINT_NOT_FOUND', `Endpoint ${endpointName} not found`, { serviceId });
+      }
 
-      // 3. Find Instance
+      // 3. Enforce the declared access policy (visibility / allow-lists /
+      //    tier / coherence / reputation) before doing any work.
+      await this.enforceAccess(service);
+
+      // 4. Enforce rate limits (counted only once access is granted).
+      this.enforceRateLimit(service);
+
+      // 5. Find Instance
       const instance = await this.findHealthyInstance(serviceId);
-      if (!instance) throw new Error(`No healthy instances for ${serviceId}`);
+      if (!instance) {
+          throw new ServiceCallError('NO_HEALTHY_INSTANCE', `No healthy instances for ${serviceId}`, { serviceId });
+      }
 
-      // 4. Calculate Cost
-      const baseCost = service.pricing.perCallCost || 0;
-      const cost = baseCost * endpoint.costMultiplier;
-      
-      if (options?.maxCost && cost > options.maxCost) throw new Error('Cost exceeded');
+      // 6. Calculate Cost.
+      //    Pricing must be explicitly declared: a missing pricing block (or a
+      //    missing perCallCost) is NOT treated as free — free is an explicit
+      //    `perCallCost: 0` choice by the provider. Fail closed otherwise.
+      const pricing = service.pricing;
+      if (
+        !pricing ||
+        typeof pricing !== 'object' ||
+        typeof pricing.perCallCost !== 'number' ||
+        !Number.isFinite(pricing.perCallCost) ||
+        pricing.perCallCost < 0
+      ) {
+        throw new ServiceCallError(
+          'PRICING_UNDECLARED',
+          `Service ${serviceId} does not declare explicit pricing ` +
+            `(perCallCost must be an explicit non-negative number; use 0 for free services)`,
+          { serviceId }
+        );
+      }
+      const baseCost = pricing.perCallCost;
+      const cost = baseCost * (endpoint.costMultiplier ?? 1);
 
-      // 5. Authorize Payment
-      const auth = await this.wallet.authorizePayment(
-          service.providerNodeId,
-          BigInt(cost * 1e18), // assuming cost is float, convert to BigInt Wei-like
-          { type: 'SERVICE_CALL', serviceId, endpointName }
-      );
+      if (options?.maxCost !== undefined && cost > options.maxCost) {
+          throw new ServiceCallError('COST_EXCEEDED', 'Cost exceeded', { cost, maxCost: options.maxCost });
+      }
 
-      // 6. Execute (Mock RPC)
+      // 7. Authorize Payment — to the node that will actually execute the
+      //    call, not to the (possibly stale) provider node on the definition.
+      const executorNode = instance.nodeId;
+      const auth = cost > 0
+          ? await this.wallet.authorizePayment(
+              executorNode,
+              BigInt(Math.round(cost * 1e18)), // cost is a float; scale to base units
+              { type: 'SERVICE_CALL', serviceId, endpointName, executorNode }
+          )
+          : null;
+
+      // 8. Execute (Mock RPC)
       // In real implementation, this would use the protocol defined (HTTP, WebSocket, Gun)
       // Here we simulate a Gun-based RPC or HTTP fetch
-      const result = await this.executeRpc(instance, endpoint, input);
+      let result: T;
+      try {
+          result = await this.executeRpc(instance, endpoint, input);
+      } catch (e) {
+          // Release the escrow: the executor never delivered.
+          if (auth) {
+              try {
+                  await this.wallet.finalizePayment(auth.id, 0n);
+              } catch {
+                  /* best effort — never mask the RPC failure */
+              }
+          }
+          throw e instanceof ServiceCallError
+              ? e
+              : new ServiceCallError('RPC_FAILED', e instanceof Error ? e.message : String(e), { serviceId, executorNode });
+      }
 
-      // 7. Finalize Payment
-      await this.wallet.finalizePayment(auth.id);
+      // 9. Finalize Payment to the executing node
+      if (auth) {
+          await this.wallet.finalizePayment(auth.id);
+      }
 
-      return { result, cost, executorNode: instance.nodeId };
+      return { result, cost, executorNode };
+  }
+
+  // ─── Access Enforcement ───────────────────────────────────────────────
+
+  /**
+   * Enforce a service definition's access rules for the local caller.
+   * Throws a ServiceCallError on the first violation.
+   *
+   * FAIL CLOSED on undeclared access: a definition without an `access` block
+   * (or without an explicit `access.visibility`) is NOT public. Only an
+   * explicit `access.visibility: 'PUBLIC'` opens a service to arbitrary RPC
+   * callers; anything undeclared is denied before any work happens.
+   */
+  private async enforceAccess(service: ServiceDefinition): Promise<void> {
+      if (service.status === 'SUSPENDED') {
+          throw new ServiceCallError('SERVICE_SUSPENDED', `Service ${service.id} is suspended`, { serviceId: service.id });
+      }
+
+      const access = service.access;
+      // Missing access block: not public, not callable. Deny.
+      if (!access || typeof access !== 'object') {
+          throw new ServiceCallError(
+              'ACCESS_UNDECLARED',
+              `Service ${service.id} declares no access policy (explicit visibility 'PUBLIC' is required)`,
+              { serviceId: service.id }
+          );
+      }
+      // Missing/unknown visibility: not public, not callable. Deny.
+      if (
+          access.visibility !== 'PUBLIC' &&
+          access.visibility !== 'RESTRICTED' &&
+          access.visibility !== 'PRIVATE'
+      ) {
+          throw new ServiceCallError(
+              'ACCESS_UNDECLARED',
+              `Service ${service.id} does not declare an explicit visibility ('PUBLIC', 'RESTRICTED' or 'PRIVATE')`,
+              { serviceId: service.id, visibility: access.visibility }
+          );
+      }
+
+      const callerNodeId = this.localNodeId;
+      const callerUserId = this.wallet.address;
+      const isProvider =
+          callerNodeId === service.providerNodeId || callerUserId === service.providerUserId;
+      if (isProvider) return;
+
+      const allowedNodes = Array.isArray(access.allowedNodes) ? access.allowedNodes : [];
+      const allowedUsers = Array.isArray(access.allowedUsers) ? access.allowedUsers : [];
+      const allowedTiers = Array.isArray(access.allowedTiers) ? access.allowedTiers : [];
+
+      // ── Visibility ───────────────────────────────────────────────────
+      if (access.visibility === 'PRIVATE') {
+          throw new ServiceCallError('VISIBILITY_DENIED', `Service ${service.id} is private`, {
+              serviceId: service.id,
+              visibility: access.visibility,
+          });
+      }
+
+      if (
+          access.visibility === 'RESTRICTED' &&
+          allowedNodes.length === 0 &&
+          allowedUsers.length === 0 &&
+          allowedTiers.length === 0
+      ) {
+          // Restricted with no allow-list: fail closed rather than open.
+          throw new ServiceCallError(
+              'VISIBILITY_DENIED',
+              `Service ${service.id} is restricted and declares no allow-list`,
+              { serviceId: service.id, visibility: access.visibility }
+          );
+      }
+
+      // ── Allow-lists (enforced whenever declared) ─────────────────────
+      if (allowedNodes.length > 0 && !allowedNodes.includes(callerNodeId)) {
+          throw new ServiceCallError('NODE_NOT_ALLOWED', `Node ${callerNodeId} is not allowed to call ${service.id}`, {
+              serviceId: service.id,
+              nodeId: callerNodeId,
+          });
+      }
+
+      if (allowedUsers.length > 0 && !allowedUsers.includes(callerUserId)) {
+          throw new ServiceCallError('USER_NOT_ALLOWED', `User ${callerUserId} is not allowed to call ${service.id}`, {
+              serviceId: service.id,
+              userId: callerUserId,
+          });
+      }
+
+      if (allowedTiers.length > 0) {
+          const balance = await this.wallet.getBalance();
+          if (!allowedTiers.includes(balance.stakingTier)) {
+              throw new ServiceCallError(
+                  'TIER_NOT_ALLOWED',
+                  `Staking tier ${balance.stakingTier} is not allowed to call ${service.id}`,
+                  { serviceId: service.id, stakingTier: balance.stakingTier, allowedTiers }
+              );
+          }
+      }
+
+      // ── Reputation / Coherence minimums ──────────────────────────────
+      if (typeof access.minReputation === 'number' && access.minReputation > 0) {
+          const reputation = await this.resolveReputation(callerUserId);
+          if (reputation === null) {
+              throw new ServiceCallError(
+                  'REPUTATION_UNVERIFIABLE',
+                  `Service ${service.id} requires a minimum reputation but none could be established`,
+                  { serviceId: service.id, minReputation: access.minReputation }
+              );
+          }
+          if (reputation < access.minReputation) {
+              throw new ServiceCallError(
+                  'REPUTATION_TOO_LOW',
+                  `Reputation ${reputation} is below the minimum ${access.minReputation} for ${service.id}`,
+                  { serviceId: service.id, reputation, minReputation: access.minReputation }
+              );
+          }
+      }
+
+      if (typeof access.minCoherence === 'number' && access.minCoherence > 0) {
+          const coherence = await this.resolveCoherence(callerUserId);
+          if (coherence === null) {
+              throw new ServiceCallError(
+                  'COHERENCE_UNVERIFIABLE',
+                  `Service ${service.id} requires a minimum coherence but none could be established`,
+                  { serviceId: service.id, minCoherence: access.minCoherence }
+              );
+          }
+          if (coherence < access.minCoherence) {
+              throw new ServiceCallError(
+                  'COHERENCE_TOO_LOW',
+                  `Coherence ${coherence} is below the minimum ${access.minCoherence} for ${service.id}`,
+                  { serviceId: service.id, coherence, minCoherence: access.minCoherence }
+              );
+          }
+      }
+  }
+
+  /**
+   * Enforce the declared rate limits for this caller.
+   *
+   * Local best-effort limiter: it stops this node from exceeding the published
+   * limits. The provider node remains the authority for its own quota.
+   */
+  private enforceRateLimit(service: ServiceDefinition): void {
+      const limits = service.access?.rateLimit;
+      if (!limits || typeof limits !== 'object') return;
+
+      const key = `${service.id}:${this.wallet.address}`;
+      const now = Date.now();
+      const timestamps = (this.rateLimitLog.get(key) ?? []).filter(t => now - t < DAY_MS);
+
+      const windows: Array<{ limit: number | undefined; windowMs: number; scope: string }> = [
+          { limit: limits.burstLimit, windowMs: BURST_WINDOW_MS, scope: 'burst' },
+          { limit: limits.requestsPerMinute, windowMs: MINUTE_MS, scope: 'per-minute' },
+          { limit: limits.requestsPerHour, windowMs: HOUR_MS, scope: 'per-hour' },
+          { limit: limits.requestsPerDay, windowMs: DAY_MS, scope: 'per-day' },
+      ];
+
+      for (const { limit, windowMs, scope } of windows) {
+          if (typeof limit !== 'number' || limit < 0) continue;
+          const used = timestamps.filter(t => now - t < windowMs).length;
+          if (used >= limit) {
+              this.rateLimitLog.set(key, timestamps);
+              throw new ServiceCallError(
+                  'RATE_LIMIT_EXCEEDED',
+                  `Rate limit exceeded for ${service.id} (${scope}: ${limit})`,
+                  { serviceId: service.id, scope, limit, windowMs, used }
+              );
+          }
+      }
+
+      timestamps.push(now);
+      this.rateLimitLog.set(key, timestamps);
+  }
+
+  private async resolveReputation(userId: string): Promise<number | null> {
+      if (this.accessContext) return this.accessContext.getReputation(userId);
+      return this.readScore(this.gun.get('reputation').get(userId));
+  }
+
+  private async resolveCoherence(userId: string): Promise<number | null> {
+      if (this.accessContext) return this.accessContext.getCoherence(userId);
+      return this.readScore(this.gun.get('coherence').get(userId));
+  }
+
+  /**
+   * Read a `{ score }` node, resolving to null when unavailable.
+   */
+  private readScore(node: any): Promise<number | null> {
+      return new Promise((resolve) => {
+          let settled = false;
+          const settle = (value: number | null) => {
+              if (settled) return;
+              settled = true;
+              clearTimeout(timer);
+              resolve(value);
+          };
+          const timer: any = setTimeout(() => settle(null), 500);
+          if (typeof timer?.unref === 'function') timer.unref();
+
+          try {
+              node.once((data: any) => {
+                  if (typeof data === 'number') return settle(data);
+                  if (data && typeof data.score === 'number') return settle(data.score);
+                  settle(null);
+              });
+          } catch {
+              settle(null);
+          }
+      });
   }
 
   private async getServiceDefinition(id: string): Promise<ServiceDefinition | null> {
@@ -264,13 +587,14 @@ export class ServiceManager {
   private async findHealthyInstance(serviceId: string): Promise<ServiceInstance | null> {
       return new Promise((resolve) => {
           this.gun.get('services').get(serviceId).get('instances').map().once((inst: any) => {
-              if (inst && inst.status === 'RUNNING' && inst.health.healthy) {
+              if (inst && inst.status === 'RUNNING' && inst.health?.healthy === true && inst.nodeId) {
                   resolve(inst);
                   // Return early if map allows, or just let first one win logic
               }
           });
           // Timeout fallback
-          setTimeout(() => resolve(null), 500);
+          const timer: any = setTimeout(() => resolve(null), 500);
+          if (typeof timer?.unref === 'function') timer.unref();
       });
   }
 

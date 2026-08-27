@@ -30,6 +30,54 @@ export interface ICryptoProvider {
 }
 
 /**
+ * Verifier for Gun.js SEA co-signatures.
+ *
+ * SEA verification requires a live SEA user/context. When no verifier is
+ * wired in, a present co-signature is reported as `unavailable` and is
+ * NEVER treated as verified (see SignedEnvelopeService.verify).
+ */
+export interface ISeaVerifier {
+  verify(data: string, seaSignature: string, author: AuthorIdentity): Promise<boolean>;
+}
+
+/**
+ * Outcome of the SEA co-signature check.
+ *
+ *   absent      — no co-signature was claimed
+ *   valid       — co-signature present and verified by a SEA verifier
+ *   invalid     — co-signature present and rejected by a SEA verifier
+ *   unavailable — co-signature present but no SEA user available to check it
+ */
+export type SeaVerificationStatus = 'absent' | 'valid' | 'invalid' | 'unavailable';
+
+/**
+ * Per-endorsement verification outcome.
+ */
+export interface EndorsementVerification {
+  /** Endorser's claimed Ed25519 public key (base64) */
+  endorserPub: string;
+  /** Endorser's claimed fingerprint */
+  endorserFingerprint: string;
+  /** Whether the endorsement signature over contentHash verified */
+  valid: boolean;
+  /** If invalid, why */
+  error?: string;
+}
+
+/**
+ * VerificationResult extended with the details the trust layer needs:
+ * explicit SEA status and per-endorsement validity.
+ */
+export interface EnvelopeVerificationResult extends VerificationResult {
+  /** Explicit SEA co-signature state — 'unavailable' is never "verified" */
+  seaVerification: SeaVerificationStatus;
+  /** Verification outcome for each endorsement, in envelope order */
+  endorsements: EndorsementVerification[];
+  /** Non-fatal problems (e.g. unverifiable co-signature/endorsements) */
+  warnings: string[];
+}
+
+/**
  * Canonicalize an object for deterministic hashing.
  *
  * Algorithm (from design/23-provenance-trust.md §2.1):
@@ -137,7 +185,10 @@ function verifyResonanceProof(
 // ═══════════════════════════════════════════════════════════════════════════
 
 export class SignedEnvelopeService implements ISignedEnvelopeService {
-  constructor(private readonly cryptoProvider: ICryptoProvider) {}
+  constructor(
+    private readonly cryptoProvider: ICryptoProvider,
+    private readonly seaVerifier?: ISeaVerifier
+  ) {}
 
   /**
    * Compute the deterministic canonical content hash for a payload.
@@ -223,17 +274,29 @@ export class SignedEnvelopeService implements ISignedEnvelopeService {
    * Verify a signed envelope's cryptographic integrity.
    *
    * Checks (design/23-provenance-trust.md §4.2.1):
+   *   0. Content hash matches the canonical payload
    *   1. Ed25519 signature over contentHash using author.pub
-   *   2. SEA co-signature (if present) — skipped if not present
+   *   2. SEA co-signature — explicit status, never implicitly "verified"
    *   3. Resonance proof validity
-   *   4. Content hash matches payload
+   *   4. Every endorsement signature over contentHash (reported per endorsement)
+   *
+   * `valid` reflects the author's own provenance chain (hash + Ed25519 +
+   * resonance). Endorsements and the SEA co-signature (whether unverifiable
+   * or invalid) never flip `valid`: both are attacker-appendable fields that
+   * are not covered by the author signature, so failing the whole envelope on
+   * them would hand any third party a trivial way to invalidate someone
+   * else's artifact. They are reported instead, and the trust layer ignores
+   * whatever did not verify.
    */
-  async verify<T>(envelope: SignedEnvelope<T>): Promise<VerificationResult> {
-    const result: VerificationResult = {
+  async verify<T>(envelope: SignedEnvelope<T>): Promise<EnvelopeVerificationResult> {
+    const result: EnvelopeVerificationResult = {
       valid: false,
       ed25519Valid: false,
       seaValid: true, // Default true when no SEA signature present
       resonanceValid: false,
+      seaVerification: 'absent',
+      endorsements: [],
+      warnings: [],
     };
 
     // Step 0: Verify contentHash matches the actual payload
@@ -261,10 +324,42 @@ export class SignedEnvelopeService implements ISignedEnvelopeService {
     }
 
     // Step 2: Verify SEA co-signature (if present)
-    if (envelope.seaSignature) {
-      // SEA verification would go through Gun.SEA.verify — stubbed for Phase 1
-      // For now, we accept it if present (SEA integration is Phase 2+)
+    if (!envelope.seaSignature) {
+      result.seaVerification = 'absent';
       result.seaValid = true;
+    } else if (!this.seaVerifier) {
+      // No SEA user available — a claimed co-signature cannot be checked, so it
+      // is explicitly reported as unavailable and never counted as verified.
+      result.seaVerification = 'unavailable';
+      result.seaValid = false;
+      result.warnings.push(
+        'SEA co-signature present but no SEA user available: co-signature NOT verified'
+      );
+    } else {
+      try {
+        const seaOk = await this.seaVerifier.verify(
+          envelope.contentHash,
+          envelope.seaSignature,
+          envelope.author
+        );
+        result.seaVerification = seaOk ? 'valid' : 'invalid';
+        result.seaValid = seaOk;
+      } catch (e) {
+        result.seaVerification = 'unavailable';
+        result.seaValid = false;
+        result.warnings.push(
+          `SEA co-signature could not be verified: ${e instanceof Error ? e.message : String(e)}`
+        );
+      }
+    }
+
+    if (result.seaVerification === 'invalid') {
+      // The co-signature is attacker-appendable and is NOT covered by the
+      // author signature, so it must never flip `valid` on someone else's
+      // artifact. Report it and let the trust layer ignore it.
+      result.warnings.push(
+        'SEA co-signature failed verification and must be ignored'
+      );
     }
 
     // Step 3: Verify resonance proof
@@ -281,9 +376,71 @@ export class SignedEnvelopeService implements ISignedEnvelopeService {
       return result;
     }
 
-    // All checks passed
+    // Step 4: Verify every endorsement signature over contentHash
+    result.endorsements = this.verifyEndorsements(envelope);
+    const unverifiable = result.endorsements.filter(e => !e.valid).length;
+    if (unverifiable > 0) {
+      result.warnings.push(
+        `${unverifiable} of ${result.endorsements.length} endorsement(s) failed signature verification and must be ignored`
+      );
+    }
+
+    // Author provenance chain passed
     result.valid = true;
     return result;
+  }
+
+  /**
+   * Verify each endorsement's Ed25519 signature over the envelope's
+   * contentHash using the endorser's claimed public key.
+   *
+   * An endorsement is only meaningful if the claimed endorser actually signed
+   * this exact contentHash — anything else is an unsigned assertion and is
+   * reported as invalid so callers can discard it.
+   */
+  private verifyEndorsements<T>(envelope: SignedEnvelope<T>): EndorsementVerification[] {
+    const endorsements = envelope.endorsements ?? [];
+    return endorsements.map(endorsement => this.verifyEndorsement(envelope.contentHash, endorsement));
+  }
+
+  private verifyEndorsement(
+    contentHash: string,
+    endorsement: Endorsement
+  ): EndorsementVerification {
+    const endorserPub = endorsement?.endorser?.pub ?? '';
+    const endorserFingerprint = endorsement?.endorser?.fingerprint ?? '';
+
+    if (!endorserPub || !endorsement?.signature) {
+      return {
+        endorserPub,
+        endorserFingerprint,
+        valid: false,
+        error: 'Endorsement is missing an endorser public key or signature',
+      };
+    }
+
+    try {
+      const valid = verifyFromBase64(
+        contentHash,
+        endorsement.signature,
+        base64ToBuffer(endorserPub)
+      );
+      return valid
+        ? { endorserPub, endorserFingerprint, valid: true }
+        : {
+            endorserPub,
+            endorserFingerprint,
+            valid: false,
+            error: 'Endorsement signature does not match the endorser public key',
+          };
+    } catch (e) {
+      return {
+        endorserPub,
+        endorserFingerprint,
+        valid: false,
+        error: `Endorsement signature could not be checked: ${e instanceof Error ? e.message : String(e)}`,
+      };
+    }
   }
 
   /**

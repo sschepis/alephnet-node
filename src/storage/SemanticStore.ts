@@ -17,6 +17,13 @@ import { GlobalMemoryField } from '../core/GMF';
 
 // --- Interfaces ---
 
+/**
+ * Marker prefix for inline content that holds base64-encoded binary bytes.
+ * `Buffer.toString()` mangles non-UTF8 payloads, so binary is stored encoded
+ * and restored by `decodeInlineContent`.
+ */
+export const BINARY_CONTENT_MARKER = 'base64:';
+
 export interface ContentItem {
   contentId: string;
   title: string;
@@ -112,6 +119,8 @@ export interface SemanticQuery {
     categories?: string[];
     languages?: string[];
     minCoherence?: number;
+    /** Threshold applied to the computed SMF similarity score. */
+    minSimilarity?: number;
     includeGMF?: boolean;
   };
   ranking?: {
@@ -149,13 +158,76 @@ export interface SemanticQueryResult {
 
 // --- Implementation ---
 
+/**
+ * Decides whether a content contribution has achieved network consensus and
+ * may therefore be written into the Global Memory Field.
+ *
+ * Implementations typically run the Coherent-Commit protocol over the mesh and
+ * resolve `true` only once a 2/3 stake-weighted supermajority accepts.
+ */
+export type GMFConsensusGate = (contribution: {
+  proposalId: string;
+  contentId: string;
+  normalForm: string;
+  smf: SMFVector;
+}) => Promise<boolean>;
+
 export class SemanticContentStore {
+  /**
+   * Local index of items known to this store, keyed by contentId.
+   * Populated by `store()` and by successful `get()` fetches, and used as the
+   * candidate set for `query()`. Bounded by MAX_LOCAL_INDEX_ENTRIES.
+   */
+  private static readonly MAX_LOCAL_INDEX_ENTRIES = 1000;
+  private localIndex: Map<string, ContentItem> = new Map();
+  private pendingGMFContributions: Map<string, string> = new Map();
+
   constructor(
     private gun: any,
     private gmf: GlobalMemoryField,
     private embedder: EmbeddingService,
-    private identity: KeyTriplet
+    private identity: KeyTriplet,
+    private consensusGate?: GMFConsensusGate
   ) {}
+
+  /**
+   * Retry every contribution that is still awaiting consensus, dropping those
+   * the gate now refuses (or those whose proposal is no longer meaningful).
+   * Call this periodically (or after consensus events) so the pending set can
+   * never grow without bound.
+   */
+  async flushPendingGMFContributions(): Promise<number> {
+    let flushed = 0;
+    for (const [contentId, proposalId] of [...this.pendingGMFContributions]) {
+      const item = this.localIndex.get(contentId);
+      if (!item) {
+        this.pendingGMFContributions.delete(contentId);
+        continue;
+      }
+      const approved = this.consensusGate
+        ? await this.consensusGate({
+            proposalId,
+            contentId,
+            normalForm: `content:${contentId}`,
+            smf: item.semantic.smf as SMFVector
+          })
+        : false;
+      if (!approved) continue;
+      try {
+        await this.gmf.insert(
+          { term: { id: contentId }, normalForm: `content:${contentId}` },
+          item.semantic.smf as SMFVector,
+          { nodeId: this.identity.fingerprint, proposalId, consensusAchieved: true }
+        );
+        this.pendingGMFContributions.delete(contentId);
+        flushed++;
+      } catch {
+        // The contribution stays pending for the next flush; a consensus or
+        // integrity error must not abort the sweep.
+      }
+    }
+    return flushed;
+  }
 
   // --- Ingestion ---
 
@@ -174,12 +246,24 @@ export class SemanticContentStore {
       contributeToGMF?: boolean;
     }
   ): Promise<ContentItem> {
-    const contentStr = content.toString();
-    const contentId = await contentHash(contentStr, this.embedder.modelName);
+    // Binary payloads are base64-encoded behind a marker so that retrieval
+    // round-trips the exact bytes instead of a lossy utf8 conversion.
+    const isBinary = Buffer.isBuffer(content);
+    const payload = isBinary
+      ? `${BINARY_CONTENT_MARKER}${(content as Buffer).toString('base64')}`
+      : (content as string).toString();
+
+    const contentId = await contentHash(payload, this.embedder.modelName);
+
+    // Only text carries semantics: describe binary by its metadata instead of
+    // embedding base64 noise.
+    const indexText = isBinary
+      ? `${metadata.title} ${metadata.mimeType} ${(metadata.tags ?? []).join(' ')}`
+      : payload;
     
     // Chunk content
     const chunkSize = options?.chunkSize ?? 1000;
-    const chunkData = this.chunkContent(contentStr, chunkSize);
+    const chunkData = this.chunkContent(indexText, chunkSize);
     
     // Embed chunks
     const chunkEmbeddings = await this.embedder.batchEmbedToSMF(chunkData.map(c => c.content));
@@ -197,7 +281,7 @@ export class SemanticContentStore {
     
     // Domain & Metadata
     const domain = determineDomain(aggregateSMF);
-    const keywords = this.simpleExtractKeywords(contentStr); // Simplified extraction
+    const keywords = this.simpleExtractKeywords(indexText); // Simplified extraction
     
     const item: ContentItem = {
       contentId,
@@ -207,11 +291,11 @@ export class SemanticContentStore {
       ownerId: this.identity.fingerprint,
       source: { type: 'USER_UPLOAD' },
       content: {
-        inline: contentStr.length < 1_000_000 ? contentStr : undefined,
-        externalRef: contentStr.length >= 1_000_000 ? {
+        inline: payload.length < 1_000_000 ? payload : undefined,
+        externalRef: payload.length >= 1_000_000 ? {
             protocol: 'GUN', // Placeholder
             uri: `gun://content/${contentId}/raw`,
-            size: contentStr.length,
+            size: payload.length,
             checksum: contentId // simplified
         } : undefined
       },
@@ -223,7 +307,7 @@ export class SemanticContentStore {
         primeFactors: [], // Logic to compute primes needed
         keywords,
         entities: [], // Logic needed
-        summary: contentStr.slice(0, 200) + '...', // Simple summary
+        summary: indexText.slice(0, 200) + '...', // Simple summary
         embeddingModel: this.embedder.modelName,
         lastIndexedAt: Date.now()
       },
@@ -240,6 +324,7 @@ export class SemanticContentStore {
     };
     
     await this.storeInGun(item);
+    this.indexItem(item);
     
     if (options?.contributeToGMF && metadata.visibility.contributeToGMF) {
       await this.contributeToGMF(item);
@@ -248,10 +333,32 @@ export class SemanticContentStore {
     return item;
   }
 
+  /**
+   * Restore an item's inline content. Binary payloads come back as a Buffer
+   * with the exact original bytes.
+   */
+  decodeInlineContent(item: ContentItem): string | Buffer | null {
+    const inline = item.content.inline;
+    if (inline === undefined) return null;
+
+    if (inline.startsWith(BINARY_CONTENT_MARKER)) {
+      return Buffer.from(inline.slice(BINARY_CONTENT_MARKER.length), 'base64');
+    }
+    return inline;
+  }
+
   // --- Query ---
 
-  async query(query: SemanticQuery): Promise<SemanticQueryResult> {
+  /**
+   * Search the local index.
+   * 
+   * @param requesterId Identity the results are filtered for. Defaults to the
+   *   local node identity; pass the remote identity when serving a peer so that
+   *   PRIVATE/FRIENDS/RESTRICTED items stay hidden.
+   */
+  async query(query: SemanticQuery, requesterId?: string): Promise<SemanticQueryResult> {
     const startTime = Date.now();
+    const viewer = requesterId ?? this.identity.fingerprint;
     
     let querySMF = query.smfVector;
     if (!querySMF) {
@@ -260,17 +367,29 @@ export class SemanticContentStore {
         else querySMF = new Array(16).fill(0) as unknown as SMFVector;
     }
 
-    // TODO: Efficient indexing. For now, fetch recent and filter.
-    // In Gun, we'd use an index. Here we simulate getting a collection.
     const candidates = await this.fetchCandidateItems();
     
     const items = candidates.map(item => {
+        // Access control first: never score content the requester cannot see
+        if (!this.isVisibleTo(item, viewer)) return null;
+        
         const sim = cosineSimilarity(querySMF as SMFVector, item.semantic.smf);
         // Basic filtering
         if (query.filters) {
             if (query.filters.types && !query.filters.types.includes(item.type)) return null;
             if (query.filters.domains && !query.filters.domains.includes(item.semantic.domain)) return null;
+            if (query.filters.owners && !query.filters.owners.includes(item.ownerId)) return null;
+            if (query.filters.tags && !query.filters.tags.some(t => item.tags.includes(t))) return null;
+            if (query.filters.languages && !query.filters.languages.includes(item.language)) return null;
+            if (query.filters.categories && 
+                !query.filters.categories.includes(item.category ?? '')) return null;
+            if (query.filters.dateRange?.after !== undefined && 
+                item.createdAt < query.filters.dateRange.after) return null;
+            if (query.filters.dateRange?.before !== undefined && 
+                item.createdAt > query.filters.dateRange.before) return null;
             if (query.filters.minCoherence && (item.coherenceProof?.coherence ?? 0) < query.filters.minCoherence) return null;
+            // Similarity threshold applies to the score computed above
+            if (query.filters.minSimilarity !== undefined && sim < query.filters.minSimilarity) return null;
         }
         
         return {
@@ -298,34 +417,112 @@ export class SemanticContentStore {
     };
   }
 
+  /**
+   * Find items semantically similar to `contentId`.
+   * The `minSimilarity` threshold is applied to the actual SMF similarity score.
+   */
   async findSimilar(contentId: string, options?: {
     limit?: number;
     minSimilarity?: number;
     sameOwnerOnly?: boolean;
-  }): Promise<SemanticQueryResult> {
-    const content = await this.get(contentId);
+  }, requesterId?: string): Promise<SemanticQueryResult> {
+    const content = await this.get(contentId, requesterId);
     if (!content) throw new Error(`Content ${contentId} not found`);
     
-    return this.query({
+    const limit = options?.limit ?? 10;
+    
+    const result = await this.query({
       smfVector: content.semantic.smf,
       filters: {
         owners: options?.sameOwnerOnly ? [content.ownerId] : undefined,
-        minCoherence: options?.minSimilarity // abuse field for similarity thresh? No, query filters don't have minSim.
+        minSimilarity: options?.minSimilarity
       },
       ranking: { strategy: 'RELEVANCE' },
-      results: { limit: options?.limit ?? 10 }
-    });
+      // Request one extra slot: the source item itself matches perfectly
+      results: { limit: limit + 1 }
+    }, requesterId);
+    
+    // The source item is not "similar to itself"
+    const matches = result.items
+      .filter(entry => entry.content.contentId !== contentId)
+      .slice(0, limit);
+    
+    return {
+      ...result,
+      total: matches.length,
+      items: matches
+    };
   }
 
-  async get(contentId: string): Promise<ContentItem | null> {
+  /**
+   * Fetch a single content item.
+   *
+   * Visibility is enforced (fail closed): with no `requesterId` only PUBLIC
+   * items are returned; PRIVATE/FRIENDS/RESTRICTED items require the matching
+   * requester. This closes the historical bypass where `get()` ignored the
+   * visibility model that `query()` enforced.
+   *
+   * When a backing store (Gun) is available the item is re-read from it rather
+   * than served from the local index, so a remotely-updated item is never
+   * served stale.
+   */
+  async get(contentId: string, requesterId?: string): Promise<ContentItem | null> {
+    if (this.gun && typeof this.gun.get === 'function') {
+      const item = await this.readFromGun(contentId);
+      if (item === null) return null;
+      return this.isVisibleTo(item, requesterId) ? item : null;
+    }
+
+    const cached = this.localIndex.get(contentId);
+    if (!cached) return null;
+    return this.isVisibleTo(cached, requesterId) ? cached : null;
+  }
+
+  private readFromGun(contentId: string): Promise<ContentItem | null> {
     return new Promise((resolve) => {
         const timeout = setTimeout(() => resolve(null), 1000);
         this.gun.get('content').get(contentId).once((data: any) => {
             clearTimeout(timeout);
-            if (data && data.item) resolve(data.item); // Assuming data structure matches storage
+            if (data && data.item) {
+                const item = data.item as ContentItem;
+                this.indexItem(item);
+                resolve(item);
+            }
             else resolve(null);
         });
     });
+  }
+
+  // --- Access control ---
+
+  /**
+   * Visibility enforcement:
+   * - owner sees everything they own
+   * - PUBLIC: everyone
+   * - FRIENDS: identities on the friends list
+   * - RESTRICTED: identities on the allowlist
+   * - PRIVATE: owner only
+   */
+  private isVisibleTo(item: ContentItem, requesterId?: string): boolean {
+    const expired = item.visibility.expiresAt != null && item.visibility.expiresAt < Date.now();
+    const isOwner = requesterId !== undefined && requesterId === item.ownerId;
+    
+    if (isOwner) return true;
+    if (expired) return false;
+    
+    switch (item.visibility.level) {
+      case 'PUBLIC':
+        return true;
+      case 'FRIENDS':
+        return requesterId !== undefined &&
+          (item.visibility.friendsList ?? []).includes(requesterId);
+      case 'RESTRICTED':
+        return requesterId !== undefined &&
+          (item.visibility.allowedUsers ?? []).includes(requesterId);
+      case 'PRIVATE':
+      default:
+        return false;
+    }
   }
 
   // --- Internal ---
@@ -351,28 +548,96 @@ export class SemanticContentStore {
   }
 
   private async storeInGun(item: ContentItem): Promise<void> {
+      if (!this.gun || typeof this.gun.get !== 'function') return;
       return new Promise((resolve) => {
           this.gun.get('content').get(item.contentId).put({ item }, (ack: any) => resolve());
           // Update indices...
       });
   }
 
+  /**
+   * Contribute an item to the Global Memory Field.
+   *
+   * GMF writes are consensus-gated: `GlobalMemoryField.insert` rejects any
+   * payload that has not achieved consensus. A store cannot vote on its own
+   * behalf, so the decision is delegated to the injected `consensusGate`.
+   * Without a gate the contribution is recorded as pending rather than being
+   * force-written, so local content never fabricates network agreement.
+   */
   private async contributeToGMF(item: ContentItem): Promise<void> {
+      const proposalId = `prop-${item.contentId}`;
       const proposal = {
           term: { id: item.contentId },
           normalForm: `content:${item.contentId}`
       };
+
+      const approved = this.consensusGate
+          ? await this.consensusGate({
+                proposalId,
+                contentId: item.contentId,
+                normalForm: proposal.normalForm,
+                smf: item.semantic.smf as SMFVector
+            })
+          : false;
+
+      if (!approved) {
+          this.pendingGMFContributions.set(item.contentId, proposalId);
+          return;
+      }
+
       await this.gmf.insert(proposal, item.semantic.smf as SMFVector, {
           nodeId: this.identity.fingerprint,
-          proposalId: `prop-${item.contentId}`,
-          consensusAchieved: false
+          proposalId,
+          consensusAchieved: true
       });
+      this.pendingGMFContributions.delete(item.contentId);
+  }
+
+  /**
+   * Content ids awaiting consensus before they can enter the GMF.
+   */
+  get pendingGMFCount(): number {
+      return this.pendingGMFContributions.size;
   }
   
+  /**
+   * Add/replace an item in the local index used by `query()`.
+   *
+   * The index is a query accelerator, not an authority — it is bounded (LRU)
+   * so a long-lived node serving many content ids cannot grow without limit.
+   */
+  private indexItem(item: ContentItem): void {
+      if (this.localIndex.has(item.contentId)) {
+          this.localIndex.delete(item.contentId);
+      }
+      this.localIndex.set(item.contentId, item);
+      while (this.localIndex.size > SemanticContentStore.MAX_LOCAL_INDEX_ENTRIES) {
+          const oldest = this.localIndex.keys().next().value;
+          if (oldest === undefined) break;
+          this.localIndex.delete(oldest);
+      }
+  }
+
+  /**
+   * Remove an item from the local index.
+   */
+  removeFromIndex(contentId: string): boolean {
+      return this.localIndex.delete(contentId);
+  }
+
+  /**
+   * Number of items currently held in the local index.
+   */
+  get indexedCount(): number {
+      return this.localIndex.size;
+  }
+  
+  /**
+   * Candidate set for a query: every item this store knows about locally.
+   * Network/GMF candidates are merged in by the caller layers.
+   */
   private async fetchCandidateItems(): Promise<ContentItem[]> {
-      // Mock fetch of recent items
-      // In real implementation, this streams from Gun
-      return []; 
+      return Array.from(this.localIndex.values());
   }
 
   private simpleExtractKeywords(text: string): string[] {

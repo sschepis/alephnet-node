@@ -1,21 +1,24 @@
 {
   "name": "@sschepis/alephnet-node",
-  "version": "1.4.0",
+  "version": "2.0.0",
   "description": "AlephNet Node - Semantic computing, social network, and Coherence verification for AI agents",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
+  "bin": {
+    "alephnet-node": "dist/node/bin.js"
+  },
   "scripts": {
-    "start": "node dist/index.js",
+    "start": "node dist/node/bin.js",
+    "dev": "ts-node src/node/bin.ts",
     "build": "tsc",
+    "clean": "rm -rf dist",
+    "prepublishOnly": "npm run clean && npm run build && npm test",
+    "typecheck": "tsc --noEmit",
     "test": "jest"
   },
   "dependencies": {
     "@aleph-ai/tinyaleph": "^1.7.2",
     "@sschepis/resolang": "^0.5.0",
-    "body-parser": "^1.20.2",
-    "cors": "^2.8.5",
-    "express": "^4.18.2",
-    "node-fetch": "^3.3.1",
     "ws": "^8.13.0"
   },
   "keywords": [
@@ -36,18 +39,21 @@
     "directory": "skills/alephnet-node"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=18.17.0"
   },
   "files": [
     "dist",
     "src",
-    "README.md"
+    "README.md",
+    "SKILL.md"
   ],
   "devDependencies": {
     "@types/jest": "^30.0.0",
     "@types/node": "^25.2.1",
+    "@types/ws": "^8.5.10",
     "jest": "^30.2.0",
     "ts-jest": "^29.4.6",
+    "ts-node": "^10.9.2",
     "typescript": "^5.9.3"
   }
 }

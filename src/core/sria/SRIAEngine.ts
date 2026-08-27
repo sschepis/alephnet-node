@@ -20,6 +20,8 @@ import { Quaternion } from '../../common/math';
 import {
   calculateVariationalFreeEnergy,
   calculateSurprisal,
+  calculatePredictionError,
+  predictObservation,
   updateBeliefs,
   normalizeBeliefs,
   calculateBeliefEntropy
@@ -38,6 +40,7 @@ import {
   generatePolicies,
   evaluatePolicies,
   selectPolicy,
+  getTopPolicies,
   getDefaultPoliciesForState,
   refinePolicyFromOutcome
 } from './PolicySelection';
@@ -56,6 +59,19 @@ const DEFAULT_MODEL_PARAMS: GenerativeModelParams = {
   learningRate: 0.1,
   explorationBonus: 0.3,
   goalWeight: 0.7
+};
+
+/**
+ * Allowed lifecycle transitions. Any transition outside this graph is rejected.
+ */
+const VALID_TRANSITIONS: Record<SRIALifecycleState, SRIALifecycleState[]> = {
+  DORMANT: ['PERCEIVING'],
+  PERCEIVING: ['DECIDING', 'CONSOLIDATING'],
+  DECIDING: ['ACTING', 'PERCEIVING'],
+  ACTING: ['LEARNING'],
+  LEARNING: ['PERCEIVING', 'CONSOLIDATING', 'DECIDING'],
+  CONSOLIDATING: ['SLEEPING', 'DORMANT'],
+  SLEEPING: ['DORMANT', 'PERCEIVING']
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -141,32 +157,55 @@ export class SRIAEngine {
   
   /**
    * Transition to a new lifecycle state
+   * 
+   * Invalid transitions are rejected: the lifecycle state is left untouched and
+   * no state_change event is emitted.
    */
-  private transitionTo(newState: SRIALifecycleState): void {
-    if (!this.state) return;
+  private transitionTo(newState: SRIALifecycleState): boolean {
+    if (!this.state) return false;
     
     const oldState = this.state.lifecycleState;
+    if (oldState === newState) return true;
+    
+    if (!this.canTransition(oldState, newState)) {
+      logger.warn('Invalid lifecycle transition rejected', { from: oldState, to: newState });
+      return false;
+    }
+    
     this.state.lifecycleState = newState;
     
     logger.debug('State transition', { from: oldState, to: newState });
     this.emitEvent('state_change', { oldState, newState });
+    return true;
+  }
+  
+  /**
+   * Reach a lifecycle state, walking through one intermediate state when the
+   * target is not directly reachable (e.g. LEARNING -> DECIDING -> ACTING).
+   */
+  private transitionToVia(target: SRIALifecycleState): boolean {
+    if (!this.state) return false;
+    if (this.canTransition(this.state.lifecycleState, target) ||
+        this.state.lifecycleState === target) {
+      return this.transitionTo(target);
+    }
+    
+    const from = this.state.lifecycleState;
+    for (const intermediate of VALID_TRANSITIONS[from] ?? []) {
+      if (this.canTransition(intermediate, target)) {
+        return this.transitionTo(intermediate) && this.transitionTo(target);
+      }
+    }
+    
+    logger.warn('No valid path to lifecycle state', { from, to: target });
+    return false;
   }
   
   /**
    * Check if transition is valid
    */
   private canTransition(from: SRIALifecycleState, to: SRIALifecycleState): boolean {
-    const validTransitions: Record<SRIALifecycleState, SRIALifecycleState[]> = {
-      DORMANT: ['PERCEIVING'],
-      PERCEIVING: ['DECIDING', 'CONSOLIDATING'],
-      DECIDING: ['ACTING', 'PERCEIVING'],
-      ACTING: ['LEARNING'],
-      LEARNING: ['PERCEIVING', 'CONSOLIDATING', 'DECIDING'],
-      CONSOLIDATING: ['SLEEPING', 'DORMANT'],
-      SLEEPING: ['DORMANT', 'PERCEIVING']
-    };
-    
-    return validTransitions[from]?.includes(to) ?? false;
+    return VALID_TRANSITIONS[from]?.includes(to) ?? false;
   }
   
   // ═══════════════════════════════════════════════════════════════════════
@@ -175,9 +214,12 @@ export class SRIAEngine {
   
   /**
    * Run a complete Active Inference cycle
+   * 
+   * perceive -> decide -> act -> learn
    */
   async runCycle(observation: number[]): Promise<{
     policy: Policy | null;
+    outcome: ActionOutcome | null;
     freeEnergy: number;
     beliefs: BeliefState[];
   }> {
@@ -188,16 +230,26 @@ export class SRIAEngine {
     logger.debug('Running SRIA cycle', { epoch: this.state.currentEpoch });
     
     // 1. Perception Phase
-    this.transitionTo('PERCEIVING');
+    this.transitionToVia('PERCEIVING');
     await this.perceive(observation);
     
     // 2. Decision Phase
-    this.transitionTo('DECIDING');
+    this.transitionToVia('DECIDING');
     const policy = await this.decide();
     
-    // Store result before potential action
+    // 3. Action Phase
+    let outcome: ActionOutcome | null = null;
+    if (policy) {
+      outcome = await this.act(policy);
+      
+      // 4. Learning Phase
+      await this.learn(outcome);
+    }
+    
+    // Snapshot the post-learning state
     const result = {
       policy,
+      outcome,
       freeEnergy: this.state.freeEnergy,
       beliefs: [...this.state.currentBeliefs]
     };
@@ -315,35 +367,102 @@ export class SRIAEngine {
   }
   
   /**
-   * Action phase: execute the selected policy
+   * Action phase: execute a policy
+   * 
+   * When no policy is supplied the top policy for the current session state is
+   * selected from PolicySelection. The outcome is derived from the live session
+   * state (beliefs, goal state, attention) instead of fixed placeholders.
    */
-  async act(policy: Policy): Promise<ActionOutcome> {
+  async act(policy?: Policy): Promise<ActionOutcome> {
     if (!this.state) {
       throw new Error('SRIA session not initialized');
     }
     
-    this.transitionTo('ACTING');
-    logger.debug('Executing policy', { type: policy.type });
+    const candidate = policy ?? this.selectTopPolicy();
     
-    // Generate predictions for this action
-    const prediction = this.state.currentBeliefs.flatMap(b => b.primeFactors);
+    if (!candidate) {
+      logger.warn('No policy available to execute');
+      return {
+        policyId: '',
+        success: false,
+        predictionError: 0,
+        information: 0,
+        beliefUpdate: [],
+        smfDelta: []
+      };
+    }
+    
+    const reachedActing = this.transitionToVia('ACTING');
+    logger.debug('Executing policy', { type: candidate.type });
+    
+    // Re-evaluate the policy against the live state so its value reflects the
+    // beliefs and goal the engine currently holds
+    const [executed] = evaluatePolicies(
+      [candidate],
+      this.state.currentBeliefs,
+      this.goalState,
+      this.state.modelParams
+    );
+    const evaluated = executed ?? candidate;
+    
+    // Generate the observation this action is expected to produce
+    const prediction = predictObservation(this.state.currentBeliefs);
     this.state.predictions.push({
       id: generateId('pred'),
       content: prediction,
-      probability: 0.5,
-      precision: 1.0,
+      probability: this.state.currentBeliefs[0]?.probability ?? 0.5,
+      precision: this.state.attention.precision,
       generated: Date.now()
     });
     
-    // Return placeholder outcome - actual execution handled externally
-    return {
-      policyId: policy.id,
-      success: true,
-      predictionError: 0,
-      information: 0,
+    // Prediction error: how far the expected observation sits from the goal.
+    // Without a goal, fall back to the ambiguity of the policy predictions.
+    const rawError = this.goalState.length > 0
+      ? calculatePredictionError(prediction, this.goalState, 1.0) / 
+        Math.max(1, Math.sqrt(this.goalState.length))
+      : evaluated.risk;
+    const predictionError = Math.min(1, Math.max(0, rawError));
+    
+    // Information gained is the epistemic value of the executed policy
+    const information = Math.max(0, evaluated.epistemic);
+    
+    const outcome: ActionOutcome = {
+      policyId: evaluated.id,
+      success: reachedActing && Number.isFinite(evaluated.expectedFreeEnergy),
+      predictionError,
+      information,
       beliefUpdate: [],
-      smfDelta: []
+      smfDelta: this.goalState.map((goal, i) => goal - (prediction[i] ?? 0))
     };
+    
+    if (!policy) {
+      // The engine picked the policy itself, report it like decide() does
+      this.emitEvent('policy_selected', { policy: evaluated });
+    }
+    
+    return outcome;
+  }
+  
+  /**
+   * Select the best (lowest expected free energy) policy available in the
+   * current lifecycle state.
+   */
+  private selectTopPolicy(): Policy | null {
+    if (!this.state) return null;
+    
+    const availableActions = getDefaultPoliciesForState(this.state.lifecycleState);
+    const evaluated = evaluatePolicies(
+      generatePolicies(
+        this.state.currentBeliefs,
+        this.state.freeEnergy,
+        availableActions
+      ),
+      this.state.currentBeliefs,
+      this.goalState,
+      this.state.modelParams
+    );
+    
+    return getTopPolicies(evaluated, 1)[0] ?? null;
   }
   
   /**
@@ -352,7 +471,7 @@ export class SRIAEngine {
   async learn(outcome: ActionOutcome): Promise<void> {
     if (!this.state) return;
     
-    this.transitionTo('LEARNING');
+    this.transitionToVia('LEARNING');
     logger.debug('Learning from outcome', { 
       policyId: outcome.policyId, 
       error: outcome.predictionError 
@@ -422,7 +541,7 @@ export class SRIAEngine {
       throw new Error('SRIA session not initialized');
     }
     
-    this.transitionTo('CONSOLIDATING');
+    this.transitionToVia('CONSOLIDATING');
     logger.debug('Consolidating beliefs');
     
     // Get high-confidence beliefs for GMF contribution
@@ -442,11 +561,17 @@ export class SRIAEngine {
   
   /**
    * Sleep phase: background processing and memory consolidation
+   * 
+   * Sleeping requires consolidation first, so the engine consolidates when the
+   * SLEEPING state is not reachable from the current state.
    */
   async sleep(duration: number = 1): Promise<void> {
     if (!this.state) return;
     
-    this.transitionTo('SLEEPING');
+    if (!this.transitionToVia('SLEEPING')) {
+      await this.consolidate();
+      this.transitionToVia('SLEEPING');
+    }
     logger.debug('Entering sleep phase', { duration });
     
     // Simulate sleep processing
@@ -457,7 +582,7 @@ export class SRIAEngine {
     this.state.attention.precision = 1.0;
     
     // Wake up
-    this.transitionTo('DORMANT');
+    this.transitionToVia('DORMANT');
   }
   
   // ═══════════════════════════════════════════════════════════════════════

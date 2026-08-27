@@ -6,8 +6,35 @@ import {
   GMFObject
 } from '../core/types';
 import { EmbeddingService } from '../services/EmbeddingService';
-import { verifyEd25519, base64ToBuffer } from '../common/crypto';
+import { verifyFromBase64, base64ToBuffer } from '../common/crypto';
 import { arraysToGunObjects, gunObjectsToArrays } from '../common/gun-utils';
+import { CONSENSUS } from '../common/constants';
+
+/**
+ * A signed coherence proof as it travels over the Gun graph.
+ * Signature and publicKey are mandatory for the proof to be considered at all.
+ */
+export interface CoherenceProof {
+  tickNumber?: number;
+  coherence?: number;
+  smfHash?: string;
+  signature?: string;
+  publicKey?: string;
+}
+
+export interface CoherenceProofEnvelope {
+  coherenceProof?: CoherenceProof;
+}
+
+/**
+ * A node that can serve a semantic request (self or a discovered peer).
+ */
+interface RoutingCandidate {
+  nodeId: string;
+  semanticDomain: string;
+  primeDomain: number[];
+  loadIndex: number;
+}
 
 export class AlephGunBridge implements IAlephGunBridge {
   private gun: any;
@@ -15,6 +42,12 @@ export class AlephGunBridge implements IAlephGunBridge {
   private agentManager: any;
   private embeddingService?: EmbeddingService;
   private isInitialized = false;
+
+  /**
+   * Minimum coherence a signed proof must claim to be accepted.
+   * Single source of truth: common/constants (must match Consensus).
+   */
+  private readonly COHERENCE_THRESHOLD = CONSENSUS.MIN_COHERENCE_THRESHOLD;
 
   async initialize(gun: any, dsnNode: any, agentManager: any, embeddingService?: EmbeddingService): Promise<void> {
     if (!gun) throw new Error("Gun instance is required");
@@ -153,60 +186,157 @@ export class AlephGunBridge implements IAlephGunBridge {
     return smf;
   }
 
+  /**
+   * Score every known candidate (self + peers) against the request and pick
+   * the best one. A peer that specializes in the required semantic domain
+   * outranks a generic local node; ties resolve in favour of self (no hop).
+   */
   async routeRequest(event: AgentTriggerEvent): Promise<RoutingDecision> {
     const requiredDomain = event.routing?.preferredDomain || 'cognitive';
     const requiredPrimes = event.routing?.requiredSmfAxes || [];
 
-    const selfConfig = this.dsnNode?.config || {
-        nodeId: 'self',
-        semanticDomain: 'cognitive',
-        primeDomain: [2, 3],
-        loadIndex: 0
-    };
+    const candidates = [this.selfCandidate(), ...this.collectPeerCandidates()];
 
-    let score = 0;
-    if (selfConfig.semanticDomain === requiredDomain) score += 10;
-    const overlap = (selfConfig.primeDomain || []).filter((p: number) => requiredPrimes.includes(p)).length;
-    score += overlap * 5;
-    score -= (selfConfig.loadIndex || 0) * 2;
+    const ranked = candidates
+      .map(candidate => ({
+        candidate,
+        score: this.scoreCandidate(candidate, requiredDomain, requiredPrimes)
+      }))
+      // Stable sort: self is first in the input, so it wins equal scores.
+      .sort((a, b) => b.score - a.score);
+
+    const winner = ranked[0];
+    const overlap = this.primeOverlap(winner.candidate, requiredPrimes);
 
     return {
-        targetNodeId: selfConfig.nodeId,
-        relevanceScore: Math.max(0.1, score),
-        semanticDomainMatch: selfConfig.semanticDomain === requiredDomain,
+        targetNodeId: winner.candidate.nodeId,
+        relevanceScore: Math.max(0.1, winner.score),
+        semanticDomainMatch: winner.candidate.semanticDomain === requiredDomain,
         primeDomainOverlap: overlap,
-        loadFactor: selfConfig.loadIndex || 0,
-        fallbackNodes: []
+        loadFactor: winner.candidate.loadIndex,
+        fallbackNodes: ranked.slice(1).map(r => r.candidate.nodeId)
     };
   }
 
-  async verifyCoherence(proposal: any): Promise<boolean> {
-    if (!proposal.coherenceProof) return false;
-    
-    const { coherence, smfHash, signature, publicKey } = proposal.coherenceProof;
-    
-    if (signature && publicKey) {
-        try {
-            const data = JSON.stringify({ coherence, smfHash });
-            const isValid = verifyEd25519(
-                Buffer.from(data), 
-                base64ToBuffer(signature), 
-                base64ToBuffer(publicKey)
-            );
-            if (!isValid) {
-                console.warn('[AlephGunBridge] Invalid coherence signature');
-                return false;
-            }
-        } catch (e) {
-            console.error('[AlephGunBridge] Error verifying signature', e);
-            return false;
-        }
+  /**
+   * A signed coherence proof is the only acceptable proof.
+   *
+   * An unsigned (or unattributable) claim is worthless: anyone could assert
+   * perfect coherence, so a missing signature or public key is a hard reject
+   * before the threshold is even considered.
+   */
+  async verifyCoherence(proposal: CoherenceProofEnvelope): Promise<boolean> {
+    const proof = proposal?.coherenceProof;
+    if (!proof) return false;
+
+    const { coherence, smfHash, signature, publicKey } = proof;
+
+    if (typeof signature !== 'string' || signature.length === 0) {
+        console.warn('[AlephGunBridge] Coherence proof rejected: missing signature');
+        return false;
+    }
+    if (typeof publicKey !== 'string' || publicKey.length === 0) {
+        console.warn('[AlephGunBridge] Coherence proof rejected: missing public key');
+        return false;
+    }
+    if (typeof coherence !== 'number' || !Number.isFinite(coherence)) {
+        console.warn('[AlephGunBridge] Coherence proof rejected: coherence is not a number');
+        return false;
     }
 
-    if (coherence >= 0.8) {
-        return true;
+    try {
+        // Signature covers the claimed coherence AND the SMF hash, so neither
+        // can be swapped without invalidating the proof.
+        const data = JSON.stringify({ coherence, smfHash });
+        const isValid = verifyFromBase64(data, signature, base64ToBuffer(publicKey));
+        if (!isValid) {
+            console.warn('[AlephGunBridge] Invalid coherence signature');
+            return false;
+        }
+    } catch (e) {
+        console.error('[AlephGunBridge] Error verifying signature', e);
+        return false;
     }
-    return false;
+
+    return coherence >= this.COHERENCE_THRESHOLD;
+  }
+
+  // --- Routing helpers ---
+
+  private selfNodeId(): string {
+    return this.dsnNode?.config?.nodeId || 'self';
+  }
+
+  private selfCandidate(): RoutingCandidate {
+    const config = this.dsnNode?.config;
+    return {
+        nodeId: this.selfNodeId(),
+        semanticDomain: typeof config?.semanticDomain === 'string' ? config.semanticDomain : 'cognitive',
+        primeDomain: Array.isArray(config?.primeDomain) ? config.primeDomain : [],
+        loadIndex: typeof config?.loadIndex === 'number' ? config.loadIndex : 0
+    };
+  }
+
+  /**
+   * Collect routable peers. Only entries that publish a node identity are
+   * candidates; bare relay URLs (plain strings in `gunPeers`) carry no
+   * semantic metadata and are therefore not routing targets.
+   */
+  private collectPeerCandidates(): RoutingCandidate[] {
+    const raw: unknown[] = [];
+    const config = this.dsnNode?.config;
+
+    if (Array.isArray(config?.knownPeers)) raw.push(...config.knownPeers);
+    if (typeof this.dsnNode?.getPeers === 'function') {
+        const discovered = this.dsnNode.getPeers();
+        if (Array.isArray(discovered)) raw.push(...discovered);
+    }
+    if (Array.isArray(config?.gunPeers)) raw.push(...config.gunPeers);
+
+    const candidates: RoutingCandidate[] = [];
+    const seen = new Set<string>([this.selfNodeId()]);
+
+    for (const entry of raw) {
+        const candidate = this.toCandidate(entry);
+        if (!candidate || seen.has(candidate.nodeId)) continue;
+        seen.add(candidate.nodeId);
+        candidates.push(candidate);
+    }
+
+    return candidates;
+  }
+
+  private toCandidate(entry: unknown): RoutingCandidate | null {
+    if (!entry || typeof entry !== 'object') return null;
+
+    const peer = entry as Partial<DSNNodeConfig> & { id?: string };
+    const nodeId = typeof peer.nodeId === 'string'
+        ? peer.nodeId
+        : typeof peer.id === 'string' ? peer.id : null;
+    if (!nodeId) return null;
+
+    return {
+        nodeId,
+        semanticDomain: typeof peer.semanticDomain === 'string' ? peer.semanticDomain : '',
+        primeDomain: Array.isArray(peer.primeDomain) ? peer.primeDomain : [],
+        loadIndex: typeof peer.loadIndex === 'number' ? peer.loadIndex : 0
+    };
+  }
+
+  private primeOverlap(candidate: RoutingCandidate, requiredPrimes: number[]): number {
+    return candidate.primeDomain.filter((p: number) => requiredPrimes.includes(p)).length;
+  }
+
+  private scoreCandidate(
+    candidate: RoutingCandidate,
+    requiredDomain: string,
+    requiredPrimes: number[]
+  ): number {
+    let score = 0;
+    if (candidate.semanticDomain === requiredDomain) score += 10;
+    score += this.primeOverlap(candidate, requiredPrimes) * 5;
+    score -= candidate.loadIndex * 2;
+    return score;
   }
 
   async syncGMFToGraph(): Promise<void> {

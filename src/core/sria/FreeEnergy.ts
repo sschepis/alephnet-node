@@ -111,7 +111,11 @@ export function predictObservation(beliefs: BeliefState[]): number[] {
 /**
  * Calculate expected free energy G(π) for policy selection
  * 
- * G(π) = epistemic_value + pragmatic_value + risk
+ * G(π) = pragmatic_cost + risk - explorationBonus * epistemic_value
+ * 
+ * G is a COST that is MINIMIZED: cost terms (distance from the goal, ambiguity)
+ * increase it while expected information gain decreases it. Policies closer to
+ * the goal therefore have a lower G and are preferred.
  * 
  * This is used to evaluate and compare policies.
  */
@@ -121,26 +125,47 @@ export function calculateExpectedFreeEnergy(
   policyPredictions: Prediction[],
   modelParams: GenerativeModelParams
 ): { epistemic: number; pragmatic: number; risk: number; total: number } {
-  // Epistemic value: expected information gain
+  // Epistemic value: expected information gain (>= 0, reduces G)
   const epistemic = calculateEpistemicValue(beliefs, policyPredictions);
   
-  // Pragmatic value: expected goal achievement
+  // Pragmatic cost: expected distance from the goal (>= 0, increases G)
   const pragmatic = calculatePragmaticValue(policyPredictions, goalState);
   
-  // Risk: ambiguity in predictions
+  // Risk: ambiguity in predictions (>= 0, increases G)
   const risk = calculateRisk(policyPredictions);
   
-  // Combine with weights
+  // Combine with weights - lower total is a better policy
   const total = 
-    modelParams.explorationBonus * epistemic +
     modelParams.goalWeight * pragmatic +
-    risk;
+    risk -
+    modelParams.explorationBonus * epistemic;
   
   return { epistemic, pragmatic, risk, total };
 }
 
 /**
- * Calculate epistemic value (expected information gain)
+ * Normalize prediction probabilities into a distribution over samples
+ * 
+ * Prediction samples are generated independently and are not guaranteed to sum
+ * to 1. Using the raw probabilities as expectation weights would scale the
+ * epistemic/pragmatic terms arbitrarily (and can flip their sign).
+ */
+export function normalizePredictionWeights(predictions: Prediction[]): number[] {
+  if (predictions.length === 0) return [];
+  
+  const positive = predictions.map(p => Math.max(0, p.probability));
+  const total = positive.reduce((a, b) => a + b, 0);
+  
+  if (total <= 0) {
+    // Degenerate input: fall back to a uniform distribution
+    return positive.map(() => 1 / predictions.length);
+  }
+  
+  return positive.map(p => p / total);
+}
+
+/**
+ * Calculate epistemic value (expected information gain, >= 0)
  */
 export function calculateEpistemicValue(
   beliefs: BeliefState[],
@@ -151,20 +176,26 @@ export function calculateEpistemicValue(
   // Current entropy
   const currentEntropy = calculateBeliefEntropy(beliefs);
   
+  // Normalize sample probabilities so they form a proper distribution
+  const weights = normalizePredictionWeights(predictions);
+  
   // Expected entropy after observations
   let expectedEntropyAfter = 0;
-  for (const pred of predictions) {
+  for (let i = 0; i < predictions.length; i++) {
     // Assume each prediction leads to some belief update
     // This is simplified - real calculation would be more complex
-    expectedEntropyAfter += pred.probability * (currentEntropy * 0.9);
+    expectedEntropyAfter += weights[i] * (currentEntropy * 0.9);
   }
   
   // Information gain = current entropy - expected entropy after
-  return currentEntropy - expectedEntropyAfter;
+  return Math.max(0, currentEntropy - expectedEntropyAfter);
 }
 
 /**
- * Calculate pragmatic value (expected goal achievement)
+ * Calculate pragmatic cost (expected divergence from the goal, >= 0)
+ * 
+ * Larger expected distance from the goal means a larger cost, which makes the
+ * policy worse under expected free energy minimization.
  */
 export function calculatePragmaticValue(
   predictions: Prediction[],
@@ -172,21 +203,24 @@ export function calculatePragmaticValue(
 ): number {
   if (predictions.length === 0 || goalState.length === 0) return 0;
   
-  let value = 0;
+  const weights = normalizePredictionWeights(predictions);
+  let cost = 0;
   
-  for (const pred of predictions) {
+  for (let i = 0; i < predictions.length; i++) {
     // Calculate distance to goal
-    const predArray = Array.isArray(pred.content) ? pred.content as number[] : [];
-    const distance = goalState.reduce((acc, goal, i) => {
-      const predVal = predArray[i] || 0;
+    const predArray = Array.isArray(predictions[i].content) 
+      ? predictions[i].content as number[] 
+      : [];
+    const distance = goalState.reduce((acc, goal, j) => {
+      const predVal = predArray[j] || 0;
       return acc + Math.pow(goal - predVal, 2);
     }, 0);
     
-    // Negative distance weighted by probability
-    value -= pred.probability * Math.sqrt(distance);
+    // Expected distance is a cost, weighted by the sample probability
+    cost += weights[i] * Math.sqrt(distance);
   }
   
-  return value;
+  return cost;
 }
 
 /**

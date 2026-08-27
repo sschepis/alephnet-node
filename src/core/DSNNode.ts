@@ -10,6 +10,8 @@
  * - Real Ed25519 KeyTriplet identity
  */
 
+import * as fs from 'fs';
+import * as path from 'path';
 import { DSNNodeConfig, SemanticDomain, AIProviderConfig, KeyTriplet as TypesKeyTriplet } from '../core/types';
 import {
   generateKeyTriplet,
@@ -17,12 +19,41 @@ import {
   base64ToBuffer,
   signEd25519,
   bufferToBase64,
+  arraysToGunObjects,
   NETWORK,
   TIER_THRESHOLDS,
   createLogger
 } from '../common/index';
 
 const logger = createLogger('DSNNode');
+
+// Identity file holding the KeyTriplet. It contains the private key, so it is
+// written owner-read/write only.
+const KEY_FILE_NAME = 'keytriplet.json';
+const KEY_FILE_MODE = 0o600;
+
+/**
+ * Thrown when a persisted identity exists but cannot be loaded (malformed or
+ * unreadable). Regenerating silently would mint a brand-new identity and
+ * strand everything the old identity owned, so the default is to fail loudly.
+ * Callers that explicitly accept the loss pass `recoverCorruptIdentity: true`.
+ */
+export class DSNNodeIdentityError extends Error {
+  public readonly code = 'DSN_IDENTITY_CORRUPT';
+
+  constructor(message: string) {
+    super(message);
+    this.name = 'DSNNodeIdentityError';
+  }
+}
+
+/**
+ * Resolve a persistence target to a concrete file path.
+ * A `*.json` target is used as-is, anything else is treated as a data directory.
+ */
+function resolveKeyFilePath(target: string): string {
+  return target.endsWith('.json') ? target : path.join(target, KEY_FILE_NAME);
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // OPTIONS & CONFIGURATION
@@ -37,7 +68,29 @@ export interface DSNNodeOptions {
   bootstrapUrl?: string;
   seaPublicKey?: string;
   gunInstance?: unknown;
+  /**
+   * Caller-provided identity. When null/undefined a KeyTriplet is loaded from
+   * `persistKeysTo` if present, otherwise generated (and persisted).
+   */
+  keyTriplet?: KeyTriplet | null;
+  /** @deprecated use `keyTriplet` */
   existingKeyTriplet?: KeyTriplet;
+  /**
+   * Data directory (or explicit `*.json` file) used to persist the node
+   * identity across restarts.
+   */
+  persistKeysTo?: string;
+  /**
+   * Regenerate (and overwrite) the identity when the persisted file is
+   * corrupt. Defaults to false: a corrupt identity throws a typed
+   * DSNNodeIdentityError instead of silently minting a new one.
+   */
+  recoverCorruptIdentity?: boolean;
+  /**
+   * Make `start()` throw when identity persistence was requested
+   * (`persistKeysTo`) but the write failed.
+   */
+  failOnPersistError?: boolean;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -50,10 +103,15 @@ export class DSNNode {
   private isStarted: boolean = false;
   private heartbeatInterval: NodeJS.Timeout | null = null;
   private keyTriplet: KeyTriplet;
+  /** True when identity persistence was requested but the write failed. */
+  private identityPersistFailed: boolean = false;
+  private readonly options: DSNNodeOptions;
 
   constructor(options: DSNNodeOptions) {
-    // Generate or use existing KeyTriplet
-    this.keyTriplet = options.existingKeyTriplet || generateKeyTriplet();
+    this.options = options;
+
+    // Load, reuse or generate (and persist) the node identity
+    this.keyTriplet = this.resolveIdentity(options);
     
     // Calculate SMF axes based on semantic domain
     const smfAxes = this.calculateSMFAxes(options.semanticDomain);
@@ -67,6 +125,8 @@ export class DSNNode {
       domain: options.semanticDomain,
       seaPublicKey: options.seaPublicKey || '',
       gunPeers: [],
+      // Local-only identity: `priv` is required by DSNNodeConfig but is never
+      // published — use getPublicKeyTriplet()/getPublishableConfig() for that.
       keyTriplet: {
         pub: this.keyTriplet.pub,
         priv: this.keyTriplet.priv,
@@ -100,13 +160,144 @@ export class DSNNode {
   }
 
   // ═══════════════════════════════════════════════════════════════════════
+  // IDENTITY PERSISTENCE
+  // ═══════════════════════════════════════════════════════════════════════
+
+  /**
+   * Resolve the node identity: caller-provided > persisted > freshly generated.
+   * A generated identity is persisted when `persistKeysTo` is configured so the
+   * node keeps the same identity across restarts.
+   *
+   * @throws DSNNodeIdentityError when the persisted identity exists but is
+   *         corrupt and `recoverCorruptIdentity` is not set.
+   */
+  private resolveIdentity(options: DSNNodeOptions): KeyTriplet {
+    const provided = options.keyTriplet ?? options.existingKeyTriplet;
+    if (provided) {
+      return provided;
+    }
+
+    if (options.persistKeysTo) {
+      const loaded = this.loadKeyTriplet(
+        options.persistKeysTo,
+        options.recoverCorruptIdentity === true
+      );
+      if (loaded) {
+        logger.info(`Loaded persisted identity`, { fingerprint: loaded.fingerprint });
+        return loaded;
+      }
+
+      const generated = generateKeyTriplet();
+      this.identityPersistFailed = !this.persistKeyTriplet(options.persistKeysTo, generated);
+      return generated;
+    }
+
+    return generateKeyTriplet();
+  }
+
+  /**
+   * Load a KeyTriplet from disk.
+   *
+   * Returns null when the file is missing (fresh identity) or when
+   * `recover` is set and the file is corrupt (caller regenerates).
+   * Throws DSNNodeIdentityError when the file exists but is malformed or
+   * unreadable and `recover` is not set — silently minting a new identity
+   * would orphan everything the persisted identity owned.
+   */
+  private loadKeyTriplet(target: string, recover: boolean): KeyTriplet | null {
+    const file = resolveKeyFilePath(target);
+
+    try {
+      if (!fs.existsSync(file)) return null;
+
+      const parsed = JSON.parse(fs.readFileSync(file, 'utf8')) as Partial<KeyTriplet>;
+
+      if (!parsed.pub || !parsed.priv || !parsed.fingerprint || !Array.isArray(parsed.resonance)) {
+        if (recover) {
+          logger.warn(
+            `Persisted identity is malformed; regenerating and overwriting (recoverCorruptIdentity)`,
+            { file }
+          );
+          return null;
+        }
+        throw new DSNNodeIdentityError(
+          `Persisted identity at '${file}' is malformed. ` +
+            `Set recoverCorruptIdentity: true to regenerate and overwrite it.`
+        );
+      }
+
+      return {
+        pub: parsed.pub,
+        priv: parsed.priv,
+        resonance: parsed.resonance as KeyTriplet['resonance'],
+        fingerprint: parsed.fingerprint,
+        bodyPrimes: parsed.bodyPrimes ?? []
+      };
+    } catch (error) {
+      if (error instanceof DSNNodeIdentityError) throw error;
+      if (recover) {
+        logger.warn(`Failed to load persisted identity; regenerating (recoverCorruptIdentity)`, {
+          file
+        });
+        return null;
+      }
+      throw new DSNNodeIdentityError(
+        `Failed to load persisted identity at '${file}': ${
+          error instanceof Error ? error.message : String(error)
+        }`
+      );
+    }
+  }
+
+  /**
+   * Persist a KeyTriplet as JSON with owner-only (0600) permissions.
+   * Returns false (and logs a warning) when the write fails so callers can
+   * decide whether an unpersisted identity is acceptable.
+   */
+  private persistKeyTriplet(target: string, triplet: KeyTriplet): boolean {
+    const file = resolveKeyFilePath(target);
+
+    try {
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(file, JSON.stringify(triplet, null, 2), {
+        encoding: 'utf8',
+        mode: KEY_FILE_MODE
+      });
+      // writeFileSync ignores `mode` for pre-existing files
+      fs.chmodSync(file, KEY_FILE_MODE);
+
+      logger.info(`Persisted node identity`, { file, fingerprint: triplet.fingerprint });
+      return true;
+    } catch (error) {
+      logger.warn(
+        `Failed to persist node identity (identity will not survive restart)`,
+        { file, error: error instanceof Error ? error.message : String(error) }
+      );
+      return false;
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
   // LIFECYCLE METHODS
   // ═══════════════════════════════════════════════════════════════════════
 
   /**
    * Starts the DSNNode, initializing the Gun instance and local services.
+   * Repeated calls are ignored so heartbeat intervals cannot be duplicated.
    */
   async start(gunInstance?: unknown): Promise<void> {
+    if (this.isStarted) {
+      logger.warn(`Node already started, ignoring start()`, { nodeId: this.config.nodeId });
+      return;
+    }
+
+    if (this.identityPersistFailed && this.options.failOnPersistError) {
+      throw new DSNNodeIdentityError(
+        'Node identity persistence was requested but failed; refusing to start ' +
+          '(set failOnPersistError: false to run with an unpersisted identity)'
+      );
+    }
+
     logger.info(`Starting node ${this.config.nodeId}...`);
     
     if (gunInstance) {
@@ -121,11 +312,13 @@ export class DSNNode {
     this.config.lastHeartbeat = Date.now();
     this.isStarted = true;
     
-    // Start heartbeat loop
-    this.heartbeatInterval = setInterval(
-      () => this.heartbeat(), 
-      NETWORK.HEARTBEAT_INTERVAL_MS
-    );
+    // Start heartbeat loop (guarded: never run two intervals at once)
+    if (!this.heartbeatInterval) {
+      this.heartbeatInterval = setInterval(
+        () => this.heartbeat(), 
+        NETWORK.HEARTBEAT_INTERVAL_MS
+      );
+    }
     
     // Register node in mesh
     if (this.gun) {
@@ -223,6 +416,17 @@ export class DSNNode {
    */
   getFingerprint(): string {
     return this.keyTriplet.fingerprint;
+  }
+
+  /**
+   * Get a copy of the node config that is safe to publish: the private key is
+   * removed from the KeyTriplet.
+   */
+  getPublishableConfig(): Omit<DSNNodeConfig, 'keyTriplet'> & {
+    keyTriplet: Omit<TypesKeyTriplet, 'priv'>;
+  } {
+    const { keyTriplet: _local, ...rest } = this.config;
+    return { ...rest, keyTriplet: this.getPublicKeyTriplet() };
   }
 
   /**
@@ -335,7 +539,8 @@ export class DSNNode {
 
   /**
    * Register node in the mesh on startup
-   * Note: Gun.js does not support arrays, so we only put scalar/object fields.
+   * Note: Gun.js does not support arrays, so arrays are converted with
+   * `arraysToGunObjects` and the private key is never published.
    */
   private async registerInMesh(): Promise<void> {
     if (!this.gun) return;
@@ -343,7 +548,9 @@ export class DSNNode {
     const gun = this.gun as any;
     if (typeof gun.get !== 'function') return;
 
-    // Gun.js rejects arrays — only store scalar properties
+    // Sanitized identity: the private key must never reach the mesh graph
+    const publicKeyTriplet = this.getPublicKeyTriplet();
+
     const meshData: Record<string, any> = {
       nodeId: this.config.nodeId,
       name: this.config.name,
@@ -357,7 +564,8 @@ export class DSNNode {
       loadIndex: this.config.loadIndex,
       stakingTier: this.config.stakingTier,
       alephBalance: this.config.alephBalance,
-      fingerprint: this.keyTriplet.fingerprint,
+      keyTriplet: arraysToGunObjects(publicKeyTriplet),
+      fingerprint: publicKeyTriplet.fingerprint,
       registeredAt: Date.now()
     };
     

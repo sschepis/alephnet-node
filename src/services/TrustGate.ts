@@ -11,6 +11,22 @@ import type {
 
 type RiskLevel = 'low' | 'medium' | 'high' | 'critical';
 
+/**
+ * Hardened ITrustGate contract.
+ *
+ * `ITrustGate.checkAll(envelope, trust)` let the caller pass in a trust
+ * assessment that was never bound to the envelope, which made capability
+ * gating trivially bypassable. This variant drops that parameter: checkAll
+ * derives the assessment from the envelope itself (hence async), so the only
+ * way to influence the decision is to control the signed envelope.
+ */
+export interface ISecureTrustGate extends Omit<ITrustGate, 'checkAll'> {
+  checkAll<T>(
+    envelope: SignedEnvelope<T>,
+    expectedAuthorFingerprint?: string
+  ): Promise<Map<Capability, CapabilityCheckResult>>;
+}
+
 interface MatrixRule {
   decision: CapabilityDecision;
   risk?: RiskLevel;
@@ -114,7 +130,7 @@ const CAPABILITY_MATRIX: Partial<Record<Capability, Partial<Record<TrustLevel, M
   },
 };
 
-export class TrustGate implements ITrustGate {
+export class TrustGate implements ISecureTrustGate {
   constructor(private readonly evaluator: ITrustEvaluator) {}
 
   /**
@@ -140,6 +156,9 @@ export class TrustGate implements ITrustGate {
   /**
    * Check whether a capability is allowed for a given trust assessment.
    * Implements the Capability Matrix logic.
+   *
+   * This is the pure matrix lookup. Prefer checkCapability/checkAll, which
+   * derive the assessment from the envelope themselves.
    */
   check(capability: Capability, trust: TrustAssessment): CapabilityCheckResult {
     if (trust.level === 'REVOKED') {
@@ -157,13 +176,39 @@ export class TrustGate implements ITrustGate {
 
   /**
    * Check all requested capabilities for an envelope.
+   *
+   * The assessment is always computed here from the envelope via the
+   * TrustEvaluator — it is never supplied by the caller, so a caller cannot
+   * hand in a hand-written "SELF/1.0" assessment that is unrelated to (and
+   * unbound from) the envelope being gated.
+   *
+   * @param envelope The envelope whose requestedCapabilities are gated.
+   * @param expectedAuthorFingerprint Optional binding: when provided, the
+   *   envelope must actually be authored by that fingerprint, otherwise every
+   *   capability is denied.
    */
-  checkAll(
-    envelope: SignedEnvelope<unknown>,
-    trust: TrustAssessment
-  ): Map<Capability, CapabilityCheckResult> {
+  async checkAll<T>(
+    envelope: SignedEnvelope<T>,
+    expectedAuthorFingerprint?: string
+  ): Promise<Map<Capability, CapabilityCheckResult>> {
     const results = new Map<Capability, CapabilityCheckResult>();
-    for (const cap of envelope.requestedCapabilities) {
+    const capabilities = envelope?.requestedCapabilities ?? [];
+
+    if (
+      expectedAuthorFingerprint &&
+      expectedAuthorFingerprint !== envelope?.author?.fingerprint
+    ) {
+      for (const cap of capabilities) {
+        results.set(cap, {
+          decision: 'DENY',
+          reason: 'Envelope author does not match the expected author fingerprint',
+        });
+      }
+      return results;
+    }
+
+    const trust = await this.evaluate(envelope);
+    for (const cap of capabilities) {
       results.set(cap, this.check(cap, trust));
     }
     return results;

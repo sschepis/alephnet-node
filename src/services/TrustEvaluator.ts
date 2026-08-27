@@ -5,6 +5,7 @@
 
 import type { StakingTier } from '../common/types';
 import type {
+  Endorsement,
   ITrustEvaluator,
   SignedEnvelope,
   TrustAssessment,
@@ -20,6 +21,11 @@ import {
   TRUST_THRESHOLDS,
   TRUST_CACHE_TTL,
 } from '../common/trust-types';
+import {
+  base64ToBuffer,
+  reconstructKeyTriplet,
+  verifyFromBase64,
+} from '../common/crypto';
 import type { SignedEnvelopeService } from './SignedEnvelopeService';
 
 // ─── Provider Interfaces ─────────────────────────────────────────────────
@@ -55,6 +61,15 @@ interface CacheEntry {
   expiresAt: number;
 }
 
+/**
+ * Per-verified-endorsement contribution multiplier for the square-root
+ * dampening in `computeEndorsementScore`.
+ */
+const ENDORSEMENT_SQRT_FACTOR = 0.3;
+
+/** Hard cap on the endorsement-quality contribution (0.0–1.0). */
+const ENDORSEMENT_MAX = 1.0;
+
 // ═══════════════════════════════════════════════════════════════════════════
 // TrustEvaluator
 // ═══════════════════════════════════════════════════════════════════════════
@@ -78,34 +93,48 @@ export class TrustEvaluator implements ITrustEvaluator {
    *
    * Algorithm (design/23-provenance-trust.md §4.2):
    *   1. Signature gate — reject invalid signatures immediately
-   *   2. Self check — own artifacts get SELF/1.0
-   *   3. Override check — user-defined trust/block overrides
-   *   4. Weighted scoring — social distance, reputation, endorsements, staking, coherence
-   *   5. Level mapping — score → TrustLevel via TRUST_THRESHOLDS
+   *   2. Identity binding — author.fingerprint must derive from author.pub
+   *   3. Cache lookup — keyed by VERIFIED author fingerprint + contentHash
+   *   4. Self check — own artifacts get SELF/1.0
+   *   5. Override check — user-defined trust/block overrides
+   *   6. Weighted scoring — social distance, reputation, endorsements, staking, coherence
+   *   7. Level mapping — score → TrustLevel via TRUST_THRESHOLDS
+   *
+   * SECURITY: the signature gate runs BEFORE any cache lookup, and the cache
+   * key is scoped to the cryptographically verified author. A forged envelope
+   * that merely copies a trusted contentHash therefore cannot inherit a cached
+   * assessment, and no signer can reuse another author's assessment.
    */
   async evaluate<T>(envelope: SignedEnvelope<T>): Promise<TrustAssessment> {
-    // ── Cache Check ──────────────────────────────────────────────────
-    const cached = this.cache.get(envelope.contentHash);
+    // ── Step 1: Signature Gate (BEFORE the cache) ────────────────────
+    const verification = await this.envelopeService.verify(envelope);
+    if (!verification.valid) {
+      // Never cached: the identity of an unverifiable envelope is unknown, so
+      // there is no key it could safely be stored under.
+      return this.buildAssessment('REVOKED', -1, this.zeroFactors(false));
+    }
+
+    // ── Step 2: Identity Binding ─────────────────────────────────────
+    // Only author.pub is covered by the signature. The fingerprint is a
+    // derived value, so it must be recomputed from the verified key: a
+    // mismatch means the envelope claims an identity it cannot prove and
+    // would otherwise steal that identity's overrides, domains and cache.
+    const authorFingerprint = this.deriveFingerprint(envelope.author.pub);
+    if (!authorFingerprint || authorFingerprint !== envelope.author.fingerprint) {
+      return this.buildAssessment('REVOKED', -1, this.zeroFactors(false));
+    }
+
+    const cacheKey = this.cacheKey(authorFingerprint, envelope.contentHash);
+
+    // ── Step 3: Cache Check ──────────────────────────────────────────
+    const cached = this.cache.get(cacheKey);
     if (cached && cached.expiresAt > Date.now()) {
       return cached.assessment;
     }
 
-    // ── Step 1: Signature Gate ───────────────────────────────────────
-    const verification = await this.envelopeService.verify(envelope);
-    if (!verification.valid) {
-      return this.finalize(envelope.contentHash, 'REVOKED', -1, {
-        signatureValid: false,
-        socialDistance: 0,
-        authorReputation: 0,
-        stakingTier: 0,
-        endorsementQuality: 0,
-        coherenceScore: 0,
-      });
-    }
-
-    // ── Step 2: Self Check ───────────────────────────────────────────
+    // ── Step 4: Self Check ───────────────────────────────────────────
     if (this.ownIdentity && envelope.author.pub === this.ownIdentity.pub) {
-      return this.finalize(envelope.contentHash, 'SELF', 1.0, {
+      return this.finalize(cacheKey, 'SELF', 1.0, {
         signatureValid: true,
         socialDistance: 1.0,
         authorReputation: 1.0,
@@ -115,14 +144,14 @@ export class TrustEvaluator implements ITrustEvaluator {
       });
     }
 
-    // ── Step 3: Override Check ───────────────────────────────────────
+    // ── Step 5: Override Check ───────────────────────────────────────
     const override =
       this.findOverrideForArtifact(envelope.contentHash) ??
-      this.findOverrideForAuthor(envelope.author.fingerprint);
+      this.findOverrideForAuthor(authorFingerprint);
 
     if (override && override.trustLevel !== undefined) {
       if (override.trustLevel === 'REVOKED') {
-        return this.finalize(envelope.contentHash, 'REVOKED', -1.0, {
+        return this.finalize(cacheKey, 'REVOKED', -1.0, {
           signatureValid: true,
           socialDistance: 0,
           authorReputation: 0,
@@ -132,7 +161,7 @@ export class TrustEvaluator implements ITrustEvaluator {
         });
       }
       // Any non-REVOKED trustLevel override → VOUCHED / 0.9
-      return this.finalize(envelope.contentHash, 'VOUCHED', 0.9, {
+      return this.finalize(cacheKey, 'VOUCHED', 0.9, {
         signatureValid: true,
         socialDistance: 0.9,
         authorReputation: 0.9,
@@ -142,35 +171,38 @@ export class TrustEvaluator implements ITrustEvaluator {
       });
     }
 
-    // ── Step 4: Weighted Score Computation ───────────────────────────
+    // ── Step 6: Weighted Score Computation ───────────────────────────
     const friends = await this.socialGraph.getFriends();
 
-    // 4a: Social Distance (weight 0.30)
+    // 6a: Social Distance (weight 0.30)
     const socialDistanceScore = await this.computeSocialDistance(
-      envelope.author,
+      { pub: envelope.author.pub, fingerprint: authorFingerprint },
       friends
     );
 
-    // 4b: Author Reputation (weight 0.20)
+    // 6b: Author Reputation (weight 0.20)
     const authorReputation = await this.reputationProvider.getReputation(
       envelope.author.pub
     );
 
-    // 4c: Endorsements (weight 0.20)
-    const endorsementScore = this.computeEndorsementScore(envelope, friends);
+    // 6c: Endorsements (weight 0.20) — only cryptographically verified ones
+    const endorsementScore = this.computeEndorsementScore(
+      this.verifiedEndorsements(envelope),
+      friends
+    );
 
-    // 4d: Staking Tier (weight 0.15)
+    // 6d: Staking Tier (weight 0.15)
     const tier: StakingTier = await this.reputationProvider.getStakingTier(
       envelope.author.pub
     );
     const stakingScore = STAKING_TIER_SCORES[tier] ?? 0;
 
-    // 4e: Coherence Score (weight 0.15)
+    // 6e: Coherence Score (weight 0.15)
     const coherenceScore = await this.reputationProvider.getCoherenceScore(
       envelope.contentHash
     );
 
-    // ── Step 5: Final Score ──────────────────────────────────────────
+    // ── Step 7: Final Score ──────────────────────────────────────────
     const finalScore =
       socialDistanceScore * TRUST_WEIGHTS.socialDistance +
       authorReputation * TRUST_WEIGHTS.authorReputation +
@@ -178,7 +210,7 @@ export class TrustEvaluator implements ITrustEvaluator {
       stakingScore * TRUST_WEIGHTS.stakingTier +
       coherenceScore * TRUST_WEIGHTS.coherenceScore;
 
-    // ── Step 6: Level Determination ──────────────────────────────────
+    // ── Step 8: Level Determination ──────────────────────────────────
     const level = this.scoreToLevel(finalScore);
 
     const factors: TrustFactors = {
@@ -190,7 +222,7 @@ export class TrustEvaluator implements ITrustEvaluator {
       coherenceScore,
     };
 
-    return this.finalize(envelope.contentHash, level, finalScore, factors);
+    return this.finalize(cacheKey, level, finalScore, factors);
   }
 
   // ─── Override Management ──────────────────────────────────────────────
@@ -249,25 +281,81 @@ export class TrustEvaluator implements ITrustEvaluator {
   }
 
   /**
-   * Compute endorsement quality score.
-   * Base: min(1.0, endorsementCount / 5).
-   * Bonus: +0.1 per friend endorser (capped at 1.0).
+   * Return only the endorsements whose Ed25519 signature over the envelope's
+   * contentHash verifies against the endorser's claimed public key.
+   *
+   * Endorsements are appendable by anyone, so an unverified endorsement is
+   * just an unsigned claim: it is dropped rather than counted. Duplicate
+   * endorsers and the author's own endorsement are also dropped so trust
+   * cannot be inflated by replaying or self-vouching.
    */
-  private computeEndorsementScore<T>(
-    envelope: SignedEnvelope<T>,
+  private verifiedEndorsements<T>(envelope: SignedEnvelope<T>): Endorsement[] {
+    const endorsements = envelope.endorsements ?? [];
+    const seen = new Set<string>();
+    const verified: Endorsement[] = [];
+
+    for (const endorsement of endorsements) {
+      const pub = endorsement?.endorser?.pub;
+      if (!pub || !endorsement.signature) continue;
+      if (pub === envelope.author.pub) continue; // self-endorsement is not independent evidence
+      if (seen.has(pub)) continue;               // one endorser counts once
+
+      let signatureValid = false;
+      try {
+        signatureValid = verifyFromBase64(
+          envelope.contentHash,
+          endorsement.signature,
+          base64ToBuffer(pub)
+        );
+      } catch {
+        signatureValid = false;
+      }
+      if (!signatureValid) continue;
+
+      seen.add(pub);
+      verified.push(endorsement);
+    }
+
+    return verified;
+  }
+
+  /**
+   * Compute endorsement quality score from already-verified endorsements.
+   *
+   * Anti-sybil design: every verified endorsement contributes, but with
+   * square-root dampening — the contribution scales with sqrt(verifiedCount)
+   * instead of linearly — and a hard cap bounds the total. A batch of N
+   * freshly minted identities therefore cannot farm maximum endorsement
+   * quality the way a linear `count / 5` formula allowed.
+   *
+   * Endorsements require at least one verified endorsement for any positive
+   * contribution (zero endorsements => zero endorsement quality).
+   *
+   * Friend endorsers still carry a small bonus (+0.1 each, capped) because
+   * they are anchored in the caller's social graph. Anchoring endorsement
+   * weight to the ENDORSER'S own reputation is out of scope here: a
+   * verified endorsement currently counts regardless of the endorser's
+   * reputation, which is exactly why sqrt dampening and the cap exist.
+   */
+  private computeEndorsementScore(
+    endorsements: Endorsement[],
     friends: Array<{ id: string; publicKey: string }>
   ): number {
-    const count = envelope.endorsements.length;
-    let score = Math.min(1.0, count / 5);
+    const count = endorsements.length;
+    if (count < 1) return 0;
+
+    // Square-root dampening: contribution ∝ sqrt(verifiedCount), so each
+    // extra endorsement adds diminishing influence.
+    let score = Math.sqrt(count) * ENDORSEMENT_SQRT_FACTOR;
 
     // Bonus for friend endorsers
     const friendPubs = new Set(friends.map(f => f.publicKey));
-    const friendEndorsers = envelope.endorsements.filter(e =>
+    const friendEndorsers = endorsements.filter(e =>
       friendPubs.has(e.endorser.pub)
     );
     score += friendEndorsers.length * 0.1;
 
-    return Math.min(1.0, score);
+    return Math.min(ENDORSEMENT_MAX, score);
   }
 
   /**
@@ -282,30 +370,79 @@ export class TrustEvaluator implements ITrustEvaluator {
   }
 
   /**
-   * Build a TrustAssessment, cache it, and return it.
+   * Build a TrustAssessment, cache it under the verified-author cache key,
+   * and return it.
    */
   private finalize(
-    contentHash: string,
+    cacheKey: string,
     level: TrustLevel,
     score: number,
     factors: TrustFactors
   ): TrustAssessment {
-    const ttlMs = TRUST_CACHE_TTL[level];
-    const now = Date.now();
-    const assessment: TrustAssessment = {
-      score,
-      level,
-      factors,
-      evaluatedAt: now,
-      ttlMs,
-    };
+    const assessment = this.buildAssessment(level, score, factors);
 
-    this.cache.set(contentHash, {
+    this.cache.set(cacheKey, {
       assessment,
-      expiresAt: now + (ttlMs === Infinity ? Number.MAX_SAFE_INTEGER : ttlMs),
+      expiresAt:
+        assessment.evaluatedAt +
+        (assessment.ttlMs === Infinity ? Number.MAX_SAFE_INTEGER : assessment.ttlMs),
     });
 
     return assessment;
+  }
+
+  /**
+   * Build a TrustAssessment without caching it.
+   */
+  private buildAssessment(
+    level: TrustLevel,
+    score: number,
+    factors: TrustFactors
+  ): TrustAssessment {
+    return {
+      score,
+      level,
+      factors,
+      evaluatedAt: Date.now(),
+      ttlMs: TRUST_CACHE_TTL[level],
+    };
+  }
+
+  /**
+   * Cache key: verified author fingerprint + contentHash.
+   *
+   * Including the verified author is what stops one signer from picking up an
+   * assessment computed for a different signer's identical content.
+   */
+  private cacheKey(authorFingerprint: string, contentHash: string): string {
+    return `${authorFingerprint}:${contentHash}`;
+  }
+
+  /**
+   * Recompute an author's fingerprint from their Ed25519 public key.
+   * Returns null when the key is unusable.
+   */
+  private deriveFingerprint(pub: string): string | null {
+    if (!pub) return null;
+    try {
+      return reconstructKeyTriplet(pub).fingerprint;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Factor breakdown for a rejected envelope.
+   */
+  private zeroFactors(signatureValid: boolean): TrustFactors {
+    return {
+      signatureValid,
+      socialDistance: 0,
+      authorReputation: 0,
+      stakingTier: 0,
+      endorsementQuality: 0,
+      coherenceScore: 0,
+    };
   }
 
   /**

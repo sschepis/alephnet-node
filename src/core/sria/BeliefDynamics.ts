@@ -7,6 +7,7 @@
 
 import { BeliefState, AttentionState } from './types';
 import { Quaternion } from '../../common/math';
+import { normalizeBeliefs } from './FreeEnergy';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // QUATERNION OPERATIONS
@@ -185,30 +186,41 @@ export function updateQuaternionFromError(
 
 /**
  * Smooth belief transition using quaternion interpolation
+ * 
+ * The first four beliefs follow the interpolated quaternion, the remaining
+ * beliefs decay towards the target. The full vector is renormalized afterwards
+ * so the result is still a probability distribution.
  */
 export function smoothBeliefTransition(
   currentBeliefs: BeliefState[],
   targetBeliefs: BeliefState[],
   transitionRate: number
 ): BeliefState[] {
+  if (currentBeliefs.length === 0) return [];
+  
   const currentQ = beliefsToQuaternion(currentBeliefs);
   const targetQ = beliefsToQuaternion(targetBeliefs);
   
   const interpolatedQ = slerpQuaternion(currentQ, targetQ, transitionRate);
   
-  // Map back to beliefs
-  const components = [interpolatedQ.w, interpolatedQ.x, interpolatedQ.y, interpolatedQ.z];
+  // Map back to beliefs - quaternion components are signed, the magnitude
+  // carries the probability mass
+  const components = [interpolatedQ.w, interpolatedQ.x, interpolatedQ.y, interpolatedQ.z]
+    .map(c => Math.abs(c));
+  const componentTotal = components.reduce((a, b) => a + b, 0);
+  const leading = componentTotal > 0
+    ? components.map(c => c / componentTotal)
+    : components.map(() => 1 / components.length);
   
-  // Ensure all positive and normalized
-  const absComponents = components.map(c => Math.abs(c));
-  const total = absComponents.reduce((a, b) => a + b, 0);
-  const normalizedComponents = absComponents.map(c => c / total);
-  
-  return currentBeliefs.map((belief, i) => ({
+  const smoothed = currentBeliefs.map((belief, i) => ({
     ...belief,
-    probability: i < 4 ? normalizedComponents[i] : belief.probability * (1 - transitionRate),
+    probability: i < 4 ? leading[i] : belief.probability * (1 - transitionRate),
     lastUpdated: Date.now()
   }));
+  
+  // The leading components already sum to 1 on their own, so any belief beyond
+  // index 3 would push the total mass above 1 without this renormalization
+  return normalizeBeliefs(smoothed);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -315,6 +327,9 @@ export function pruneBeliefs(
 
 /**
  * Merge similar beliefs
+ * 
+ * Merging sums the probability of the merged beliefs, so the result is
+ * renormalized to stay a valid probability distribution.
  */
 export function mergeBeliefs(
   beliefs: BeliefState[],
@@ -356,7 +371,11 @@ export function mergeBeliefs(
     }
   }
   
-  return merged;
+  // Renormalize: summed probabilities can exceed a total mass of 1
+  return normalizeBeliefs(merged).map(b => ({
+    ...b,
+    entropy: b.probability > 0 ? -b.probability * Math.log2(b.probability) : 0
+  }));
 }
 
 /**

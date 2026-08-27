@@ -510,12 +510,12 @@ export class BehaviorSubject<T> extends Subject<T> {
     return this.currentValue;
   }
   
-  next(value: T): void {
+  override next(value: T): void {
     this.currentValue = value;
     super.next(value);
   }
   
-  subscribe(observer: Observer<T> | ((value: T) => void)): Subscription {
+  override subscribe(observer: Observer<T> | ((value: T) => void)): Subscription {
     const sub = super.subscribe(observer);
     // Emit current value immediately
     if (typeof observer === 'function') {
@@ -537,7 +537,7 @@ export class ReplaySubject<T> extends Subject<T> {
     super();
   }
   
-  next(value: T): void {
+  override next(value: T): void {
     this.buffer.push(value);
     if (this.buffer.length > this.bufferSize) {
       this.buffer.shift();
@@ -545,7 +545,7 @@ export class ReplaySubject<T> extends Subject<T> {
     super.next(value);
   }
   
-  subscribe(observer: Observer<T> | ((value: T) => void)): Subscription {
+  override subscribe(observer: Observer<T> | ((value: T) => void)): Subscription {
     // Replay buffered values
     const normalizedObserver: Observer<T> = 
       typeof observer === 'function' 

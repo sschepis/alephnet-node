@@ -74,20 +74,82 @@ export interface EventBus {
 
 // --- Implementation ---
 
-export class GunEventStore {
-    private sequence = 0;
+export interface StoredEvent {
+    sequence: number;
+    event: string;
+    storedAt: number;
+}
 
-    constructor(private gun: any) {}
+export class GunEventStore {
+    private lastTimestamp = 0;
+    private sameMsCounter = 0;
+    private localLog: StoredEvent[] = [];
+    private static readonly MAX_LOCAL_LOG = 1000;
+
+    constructor(private gun: any, private nodeId?: string) {}
+
+    /**
+     * Monotonic, restart-safe sequence derived from wall-clock time:
+     * `lastTimestamp * 1000 + per-ms counter`. A process restart can never
+     * reuse a sequence a previous run already wrote at
+     * `eventlog/<nodeId>/<seq>`, because time only moves forward. The counter
+     * keeps sequences distinct when several events land in the same
+     * millisecond; if it saturates, the logical clock is pushed forward so
+     * monotonicity is preserved.
+     */
+    private nextSequence(): number {
+        const now = Date.now();
+        if (now > this.lastTimestamp) {
+            this.lastTimestamp = now;
+            this.sameMsCounter = 0;
+        } else if (this.sameMsCounter < 999) {
+            this.sameMsCounter++;
+        } else {
+            this.lastTimestamp += 1;
+            this.sameMsCounter = 0;
+        }
+        return this.lastTimestamp * 1000 + this.sameMsCounter;
+    }
 
     async append(event: AlephEvent): Promise<number> {
-        const seq = ++this.sequence;
-        // Fire and forget persistence for speed in this demo
-        this.gun.get('eventlog').get(seq.toString()).put({
+        const seq = this.nextSequence();
+        const record: StoredEvent = {
             sequence: seq,
             event: JSON.stringify(event),
             storedAt: Date.now()
-        });
+        };
+        
+        // The sequence is namespaced by node id so peers do not overwrite
+        // each other's entries at eventlog/<nodeId>/<seq>.
+        const nodeId = this.nodeId || event.source?.nodeId;
+        if (!this.gun || !nodeId) {
+            // No shared graph (or no identity): keep a bounded local log rather than throwing
+            this.appendLocal(record);
+            return seq;
+        }
+        
+        try {
+            // Fire and forget persistence for speed in this demo
+            this.gun.get('eventlog').get(nodeId).get(seq.toString()).put(record);
+        } catch (e) {
+            this.appendLocal(record);
+        }
+        
         return seq;
+    }
+
+    /**
+     * Events retained locally because no shared graph was available
+     */
+    getLocalLog(): StoredEvent[] {
+        return [...this.localLog];
+    }
+
+    private appendLocal(record: StoredEvent): void {
+        this.localLog.push(record);
+        if (this.localLog.length > GunEventStore.MAX_LOCAL_LOG) {
+            this.localLog.shift();
+        }
     }
 }
 
@@ -120,7 +182,7 @@ export class GunEventBus implements EventBus {
     private localNodeId: string,
     private embeddingService: EmbeddingService
   ) {
-      this.store = new GunEventStore(gun);
+      this.store = new GunEventStore(gun, localNodeId);
   }
   
   async publish(event: AlephEvent): Promise<void> {
@@ -148,18 +210,60 @@ export class GunEventBus implements EventBus {
     // Here we iterate local subscriptions for simplicity of "Event Bus" abstraction over Gun
     this.routeToLocalSubscribers(event);
 
-    // 5. Broadcast (Put to Gun path)
-    // this.gun.get('events').get(event.type).set(event);
+    // 5. Broadcast to peers (Put to Gun path)
+    this.broadcast(event);
+  }
+  
+  private broadcast(event: AlephEvent): void {
+    if (!this.gun || !event.type) return;
+    
+    try {
+        // Gun cannot store nested objects/arrays directly, so the event travels
+        // as a serialized envelope.
+        this.gun.get('events').get(event.type).set({
+            id: event.id,
+            nodeId: event.source?.nodeId || this.localNodeId,
+            event: JSON.stringify(event),
+            broadcastAt: Date.now()
+        });
+    } catch (e) {
+        // Broadcast is best-effort: local delivery and persistence already happened
+        console.error(`Event broadcast failed for ${event.id}:`, e);
+    }
   }
   
   subscribe(pattern: EventPattern, handler: EventHandler): EventSubscription {
     const id = `sub-${Date.now()}-${Math.random()}`;
-    const sub = { id, pattern, handler, paused: false };
+    const sub: any = { id, pattern, handler, paused: false, closed: false, recent: new Set<string>() };
     this.subscriptions.set(id, sub);
     
-    // Hook into Gun if pattern.type matches
-    if (pattern.type) {
-        // this.gun.get('events').get(pattern.type).map().on(...)
+    // Hook into Gun so broadcasts from peers reach the same handler as
+    // locally published events. Best-effort with error isolation: a broken
+    // graph or a malformed envelope must never break subscription setup.
+    if (pattern.type && this.gun) {
+        try {
+            this.gun.get('events').get(pattern.type).map().on((data: any, _key: string) => {
+                if (sub.closed || sub.paused) return;
+                try {
+                    const raw = typeof data?.event === 'string' ? data.event : null;
+                    if (!raw) return;
+                    const event: AlephEvent = JSON.parse(raw);
+                    if (!event || typeof event !== 'object' || !event.id) return;
+                    if (sub.recent.has(event.id)) return;
+                    sub.recent.add(event.id);
+                    if (sub.recent.size > 500) sub.recent.clear();
+                    if (this.matchesPattern(event, sub.pattern)) {
+                        Promise.resolve(handler(event)).catch((err) => {
+                            console.error(`Event handler ${sub.id} failed:`, err);
+                        });
+                    }
+                } catch (e) {
+                    // Malformed envelope: ignore, keep the hook alive
+                }
+            });
+        } catch (e) {
+            // Gun hook unavailable (e.g. no graph): local routing still works
+        }
     }
 
     return new EventSubscriptionImpl(
@@ -167,16 +271,23 @@ export class GunEventBus implements EventBus {
         pattern,
         () => { sub.paused = true; },
         () => { sub.paused = false; },
-        () => { this.subscriptions.delete(id); }
+        () => {
+            sub.closed = true;
+            this.subscriptions.delete(id);
+        }
     );
   }
 
   private routeToLocalSubscribers(event: AlephEvent) {
       for (const sub of this.subscriptions.values()) {
-          if (sub.paused) continue;
-          if (this.matchesPattern(event, sub.pattern)) {
-              sub.handler(event).catch(console.error);
-          }
+          if (sub.paused || sub.closed) continue;
+          if (!this.matchesPattern(event, sub.pattern)) continue;
+          // Track delivery so the Gun broadcast hook does not re-deliver the
+          // same event to this subscription.
+          if (!sub.recent) sub.recent = new Set<string>();
+          sub.recent.add(event.id);
+          if (sub.recent.size > 500) sub.recent.clear();
+          sub.handler(event).catch(console.error);
       }
   }
   
