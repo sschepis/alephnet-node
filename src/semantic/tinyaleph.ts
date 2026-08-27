@@ -35,14 +35,11 @@ import type { Initializable } from '../common/types';
 // RUNTIME SURFACE TYPES
 // ═══════════════════════════════════════════════════════════════════════════
 
-/** Sign/index pair returned by the Fano-plane multiplication tables. */
-export interface TAMultiplyIndex {
-  index: number;
-  sign: number;
-}
+/** [index, sign] tuple returned by the Fano-plane multiplication tables. */
+export type TAMultiplyIndex = [index: number, sign: number];
 
-/** Stability classes produced by `classifyStability`. */
-export type TAStabilityClass = 'collapsed' | 'stable' | 'unstable' | 'chaotic';
+/** Stability classes produced by `classifyStability` (lowercase since 1.8.0). */
+export type TAStabilityClass = 'stable' | 'marginal' | 'chaotic';
 
 /** Dominant-axis descriptor returned by `Hypercomplex.dominantAxes`. */
 export interface TADominantAxis {
@@ -167,19 +164,54 @@ export interface TASemanticBackend {
 
 export type TASemanticBackendCtor = new (config: TABackendConfig) => TASemanticBackend;
 
-/** Result of a full `AlephEngine.run`. */
+/** Result of a full `AlephEngine.run` (the real runtime shape). */
 export interface TAEngineResult {
-  entropy: number;
-  state: TAHypercomplex;
+  input?: string;
+  inputPrimes?: number[];
+  resultPrimes?: number[];
+  output?: string;
+  entropy?: number;
+  coherence?: number;
+  lyapunov?: number;
+  stability?: TAStabilityClass;
+  collapsed?: boolean;
+  steps?: number;
+  evolutionSteps?: number;
+  framesCollected?: number;
+  bestFrameOrder?: number;
+  bestDifferential?: number;
+  fieldBased?: boolean;
+  orderParameter?: number;
 }
 
-/** Reasoning engine over a backend. */
+/** Reasoning engine over a backend (real runtime surface). */
 export interface TAAlephEngine {
   run(input: string): TAEngineResult;
-  getFieldEntropy(): number;
+  runBatch(inputs: string[]): TAEngineResult[];
+  tick(): TAEngineResult;
+  excite(primes: number[], amplitude?: number): void;
+  reason(): TAEngineResult;
+  checkCollapse(): boolean;
+  getPhysicsState(): Record<string, unknown>;
+  setBackend(type: TAEngineBackendType, config?: TABackendConfig): void;
+  getBackendInfo(): Record<string, unknown>;
+  measure(): TABornOutcome;
+  reset(): void;
+  getHistory(limit?: number): TAEngineResult[];
+  evolve(steps?: number): TAEngineResult;
 }
 
-export type TAEngineBackendType = 'semantic' | 'cryptographic' | 'crypto' | 'scientific' | 'science' | 'quantum';
+export type TAEngineBackendType =
+  | 'semantic'
+  | 'cryptographic'
+  | 'crypto'
+  | 'scientific'
+  | 'science'
+  | 'quantum'
+  | 'bioinformatics'
+  | 'bio'
+  | 'dna'
+  | 'protein';
 
 /** Born-rule measurement outcome. */
 export interface TABornOutcome {
