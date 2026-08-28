@@ -19,3 +19,6 @@ build/
 
 # Kilo tooling state
 .kilo/
+
+# Playwright browser tool state
+.playwright-mcp/
